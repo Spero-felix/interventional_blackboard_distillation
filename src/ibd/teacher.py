@@ -85,7 +85,7 @@ class TeacherRunner:
         example_id: str,
         history: History,
         *,
-        split: Literal["train", "validation", "test"] = "train",
+        split: Literal["train", "dev", "test"] = "train",
     ) -> TeacherTrace:
         records: list[CallRecord] = []
         expert_outputs: dict[ExpertName, ExpertOutput] = {}
@@ -202,4 +202,3 @@ class TeacherRunner:
         if plan is None:
             return self._run_from_state(history, state, records)
         return self._run_from_plan(history, state, plan, records)
-

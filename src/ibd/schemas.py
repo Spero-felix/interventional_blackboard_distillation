@@ -123,7 +123,7 @@ class CallRecord(StrictModel):
 
 class TeacherTrace(StrictModel):
     example_id: str
-    split: Literal["train", "validation", "test"] = "train"
+    split: Literal["train", "dev", "test"] = "train"
     history: History
     expert_outputs: dict[ExpertName, ExpertOutput]
     state: StateBlackboard
@@ -186,4 +186,3 @@ class MarginPair(StrictModel):
         if not self.order_swap_verified:
             raise ValueError("margin pairs must pass order-swap verification")
         return self
-
