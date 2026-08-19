@@ -155,16 +155,23 @@ class TeacherRunner:
     ) -> DownstreamResult:
         candidates: list[Candidate] = []
         for index, seed in enumerate(self.config.candidate_seeds, start=1):
-            candidates.append(
-                self._call(
-                    f"candidate_{index}",
-                    history,
-                    Candidate,
-                    records,
-                    context={"state": state, "plan": plan},
-                    seed=seed,
-                )
+            candidate_id = str(index)
+            candidate = self._call(
+                f"candidate_{index}",
+                history,
+                Candidate,
+                records,
+                context={
+                    "state": state,
+                    "plan": plan,
+                    "candidate_id": candidate_id,
+                    "seed": seed,
+                },
+                seed=seed,
             )
+            if candidate.candidate_id != candidate_id or candidate.seed != seed:
+                raise ValueError(f"candidate metadata mismatch for candidate_{index}")
+            candidates.append(candidate)
         critiques = [
             self._call(
                 role,

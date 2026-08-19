@@ -1,3 +1,7 @@
+import json
+
+import pytest
+
 from conftest import ScriptedBackend
 
 from ibd.teacher import NORMAL_ROLES, TeacherRunner
@@ -33,3 +37,28 @@ def test_each_expert_prompt_sees_history_but_no_peer_output(history, app_config)
     assert "relationship_pattern" not in prompts["emotion_expert"]
     assert "decision_stage" not in prompts["need_expert"]
 
+
+def test_candidate_prompt_freezes_candidate_id_and_seed(history, app_config):
+    backend = ScriptedBackend()
+    TeacherRunner(backend, app_config).run("e-seed", history)
+
+    candidate_calls = [call for call in backend.calls if call["role"].startswith("candidate_")]
+    contexts = [json.loads(call["messages"][1]["content"])["context"] for call in candidate_calls]
+
+    assert [(item["candidate_id"], item["seed"]) for item in contexts] == [
+        ("1", 11),
+        ("2", 29),
+        ("3", 47),
+    ]
+
+
+def test_teacher_rejects_candidate_with_mismatched_frozen_metadata(history, app_config):
+    class WrongSeedBackend(ScriptedBackend):
+        def _payload(self, role, seed):
+            payload = super()._payload(role, seed)
+            if role == "candidate_1":
+                payload["seed"] = 999
+            return payload
+
+    with pytest.raises(ValueError, match="candidate metadata"):
+        TeacherRunner(WrongSeedBackend(), app_config).run("e-wrong-seed", history)
