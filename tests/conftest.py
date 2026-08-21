@@ -7,10 +7,8 @@ import pytest
 class ScriptedBackend:
     """Network-free backend that emits complete production-shaped JSON."""
 
-    def __init__(self, fail_first_gate: bool = False):
-        self.fail_first_gate = fail_first_gate
+    def __init__(self):
         self.calls: list[dict[str, Any]] = []
-        self._gate_calls = 0
 
     def complete(self, *, role, messages, model_config, json_mode=True, seed=None):
         from ibd.backend import LLMResult
@@ -58,24 +56,34 @@ class ScriptedBackend:
             return expert_payloads[role]
         if role == "state_integrator":
             return {
-                "emotions": {"primary": "失落"},
-                "needs": {"primary": "被理解"},
-                "relationship": {"type": "亲密关系", "pattern": "回避沟通"},
-                "intent": {"goal": "准备一次沟通"},
-                "readiness": "探索",
-                "uncertainties": [],
-                "evidence": ["最近总觉得被忽略", "我想知道怎么开口"],
+                "emotion": "失落",
+                "intensity": "中等",
+                "primary_need": "被理解",
+                "support_goal": "准备一次坦诚沟通",
+                "readiness": "愿意探索",
+                "main_constraint": "担心对方继续回避",
+                "relationship_context": "亲密关系中的沟通僵局",
             }
         if role == "planner":
             return {
-                "support_goals": ["承接感受", "帮助准备沟通"],
-                "response_acts": ["具体反映失落", "询问期待", "给出可选表达"],
-                "avoid": ["替用户做决定"],
-                "rationale": "先承接，再协助行动",
+                "strategies": [
+                    "Reflection of feelings",
+                    "Question",
+                    "Providing Suggestions",
+                ]
             }
         if role.startswith("candidate_"):
+            index = int(role[-1])
+            strategies = {
+                1: ("S1", "Reflection of feelings"),
+                2: ("S2", "Question"),
+                3: ("S3", "Providing Suggestions"),
+            }
+            strategy_id, strategy = strategies[index]
             return {
                 "candidate_id": role.removeprefix("candidate_"),
+                "strategy_id": strategy_id,
+                "strategy": strategy,
                 "response": f"候选回复-{role[-1]}",
                 "seed": seed,
             }
@@ -86,16 +94,21 @@ class ScriptedBackend:
                 "candidate_issues": {"1": [], "2": [], "3": []},
                 "summary": "完成独立检查",
             }
-        if role in {"final_integrator", "repair"}:
-            return {"response": "我能听出那种被忽略后的失落。你更希望先理清自己的期待，还是一起准备一句开场？"}
-        if role in {"quality_gate", "quality_gate_recheck"}:
-            self._gate_calls += 1
-            reject = self.fail_first_gate and self._gate_calls == 1
+        if role == "final_integrator":
             return {
-                "accepted": not reject,
-                "safety_pass": True,
-                "defects": ["缺少选择空间"] if reject else [],
-                "repair_instruction": "补充选择空间" if reject else "",
+                "response": "我能听出那种被忽略后的失落。你更希望先理清期待，还是一起准备一句开场？",
+                "strategy_uses": [
+                    {
+                        "strategy_id": "S1",
+                        "strategy": "Reflection of feelings",
+                        "contribution": "承接用户的失落感",
+                    },
+                    {
+                        "strategy_id": "S2",
+                        "strategy": "Question",
+                        "contribution": "邀请用户选择下一步",
+                    },
+                ],
             }
         raise AssertionError(f"unexpected role: {role}")
 
@@ -118,4 +131,3 @@ def app_config():
     from ibd.config import AppConfig, ModelConfig
 
     return AppConfig(default_model=ModelConfig(model="fake-model"))
-

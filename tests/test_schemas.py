@@ -2,13 +2,38 @@ import pytest
 from pydantic import ValidationError
 
 from ibd.schemas import (
+    CritiqueIssue,
+    CritiqueReport,
     DialogueTurn,
     ExpertOutput,
     History,
     InterventionRecord,
     MarginPair,
     Mutation,
+    StrategyUse,
 )
+
+
+def test_critique_report_allows_at_most_one_issue_per_candidate():
+    issue = CritiqueIssue(
+        dimension="timing",
+        evidence="The suggestion arrives too early.",
+        severity=2,
+        suggested_revision="Ask permission first.",
+    )
+
+    with pytest.raises(ValidationError, match="at most 1 item"):
+        CritiqueReport(
+            critic="effectiveness",
+            candidate_issues={"1": [issue, issue], "2": [], "3": []},
+        )
+
+
+def test_critique_report_schema_exposes_single_issue_limit():
+    schema = CritiqueReport.model_json_schema()
+
+    issue_list = schema["properties"]["candidate_issues"]["additionalProperties"]
+    assert issue_list["maxItems"] == 1
 
 
 def test_history_must_end_with_seeker_turn():
@@ -37,17 +62,16 @@ def test_intervention_function_is_only_state_or_plan():
             example_id="e-1",
             function="CRITIC",
             mutation=Mutation(
-                function="STATE",
-                operation="downgrade",
-                field="needs",
+                operation="mask_state_field",
+                field="primary_need",
                 before="被理解",
-                after="uncertain",
+                after="<MASKED>",
             ),
             full_response="完整回复",
-            ablated_response="退化回复",
+            counterfactual_response="退化回复",
             target_dimension="specificity",
             localized_degradation=True,
-            order_swap_verified=True,
+            bidirectional_verified=True,
         )
 
 
@@ -72,11 +96,19 @@ def test_margin_pair_requires_teacher_safety_filter_to_pass():
             example_id="e-1",
             prompt="用户历史",
             chosen="更好的回复",
+            chosen_strategy_uses=[
+                StrategyUse(
+                    strategy_id="S1",
+                    strategy="Question",
+                    contribution="Invites reflection.",
+                )
+            ],
             rejected_candidate_id="c2",
+            rejected_strategy_id="S2",
+            rejected_strategy="Information",
             rejected="较差回复",
             defect_dimension="timing",
             defect_evidence="建议出现过早",
             order_swap_verified=True,
             safety_filter_passed=False,
         )
-

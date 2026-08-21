@@ -23,7 +23,13 @@ pip install -e '.[test,train]'
 pytest -q
 ```
 
-测试全部使用脚本化后端，不需要网络或模型下载。PyTorch 只用于 Student 适配器和损失。
+测试全部使用脚本化后端和随机初始化的 tiny Qwen2，不需要网络或模型下载。可以直接复用 supervisor 的 Python 环境：
+
+```bash
+PYTHONPATH=src /home/wangnianxiang/supervisor/.venv/bin/python -m pytest -q
+```
+
+该环境已经包含 PyTorch 2.6、Transformers 4.57、PEFT 0.19、BitsAndBytes 0.49 和 Safetensors 0.8。运行真实 Teacher 前仍需让当前 shell 提供 `OPENAI_API_KEY` 和 `OPENAI_BASE_URL`；`configs/deepseek_teacher.yaml` 会读取这两个变量。
 
 ## Teacher 架构与调用计数
 
@@ -47,7 +53,7 @@ pytest -q
 
 ### Stage B — Latent State–Plan Acquisition
 
-只训练 `<STATE>` 与 `<PLAN>` 两个隐式槽。Teacher 的状态黑板和支持计划是训练期特权监督，部署时不作为外部输入。
+对齐 `<|ibd_state|>` 与 `<|ibd_plan|>` 两个隐式槽。Teacher 的状态黑板和支持计划是训练期特权监督，部署时不作为外部输入。
 
 ### Stage C — Functional Intervention Distillation
 
@@ -68,6 +74,74 @@ L_D = L_chosen_SFT
 `score` 是仅覆盖回复 token 的平均 log-probability，因此不会因候选长度不同产生直接偏置。DPO 只作为对照，不是主训练机制。
 
 ## CLI
+
+### 本地 Qwen2.5-7B 流程
+
+以下命令均可使用 supervisor 的解释器。`prepare-socialsim` 产出的分组 JSON 可以直接作为 `run-teacher` 输入，diagnostic holdout 会保留在轨迹中，但 Student 导出和训练入口会拒绝将其用于更新参数。
+
+耗时命令会在交互终端的 stderr 显示进度；重定向输出或在非交互环境运行时会自动静默，stdout 中的 JSON 和摘要保持不变。
+
+```bash
+export PYTHONPATH=src
+PY=/home/wangnianxiang/supervisor/.venv/bin/python
+
+$PY -m ibd.cli prepare-socialsim \
+  --output artifacts/socialsim/prepared.json
+
+$PY -m ibd.cli run-teacher \
+  --config configs/deepseek_teacher.yaml \
+  --input artifacts/socialsim/prepared.json \
+  --output artifacts/teacher/traces.jsonl
+
+$PY -m ibd.cli build-interventions \
+  --config configs/deepseek_teacher.yaml \
+  --input artifacts/teacher/traces.jsonl \
+  --output artifacts/student/interventions.jsonl \
+  --margins-output artifacts/student/margins.jsonl \
+  --manifest artifacts/student/manifest.json
+
+CUDA_VISIBLE_DEVICES=0 $PY -m ibd.cli precompute-anchors \
+  --config configs/qwen25_7b_qlora_3090.yaml \
+  --traces artifacts/teacher/traces.jsonl \
+  --interventions artifacts/student/interventions.jsonl \
+  --output artifacts/student/anchors.safetensors
+```
+
+先用一张 3090 完成 Stage A-D、checkpoint 和评估门禁：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 $PY -m ibd.cli train-pipeline \
+  --run-name smoke-seed-42 --seed 42 \
+  --config configs/qwen25_7b_qlora_3090_smoke.yaml \
+  --traces artifacts/teacher/traces.jsonl \
+  --interventions artifacts/student/interventions.jsonl \
+  --margins artifacts/student/margins.jsonl \
+  --anchors artifacts/student/anchors.safetensors
+
+CUDA_VISIBLE_DEVICES=0 $PY -m ibd.cli evaluate \
+  --run-name smoke-seed-42 \
+  --config configs/qwen25_7b_qlora_3090_smoke.yaml \
+  --checkpoint runs/smoke-seed-42/stage-D-step-4 \
+  --traces artifacts/teacher/traces.jsonl \
+  --interventions artifacts/student/interventions.jsonl \
+  --margins artifacts/student/margins.jsonl \
+  --anchors artifacts/student/anchors.safetensors \
+  --output runs/smoke-seed-42/evaluation.json
+```
+
+smoke 配置把每个 stage 限制为一个 optimizer step。命令输出分别列出总参数、LoRA 参数、两个 input/output token 行参数、loss 和最大 gradient norm。checkpoint 只在完整 stage 边界发布；同 stage `--resume` 表示从下一 epoch 继续，并使用新的确定性 shuffle。
+
+门禁通过后，三个任务各自占用一张逻辑 GPU，不进行分布式通信：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 $PY -m ibd.cli train-pipeline --run-name seed-41 --seed 41 --config configs/qwen25_7b_qlora_3090.yaml --traces artifacts/teacher/traces.jsonl --interventions artifacts/student/interventions.jsonl --margins artifacts/student/margins.jsonl --anchors artifacts/student/anchors.safetensors
+CUDA_VISIBLE_DEVICES=1 $PY -m ibd.cli train-pipeline --run-name seed-42 --seed 42 --config configs/qwen25_7b_qlora_3090.yaml --traces artifacts/teacher/traces.jsonl --interventions artifacts/student/interventions.jsonl --margins artifacts/student/margins.jsonl --anchors artifacts/student/anchors.safetensors
+CUDA_VISIBLE_DEVICES=2 $PY -m ibd.cli train-pipeline --run-name seed-43 --seed 43 --config configs/qwen25_7b_qlora_3090.yaml --traces artifacts/teacher/traces.jsonl --interventions artifacts/student/interventions.jsonl --margins artifacts/student/margins.jsonl --anchors artifacts/student/anchors.safetensors
+```
+
+`generate` 默认是正常一次生成。anchor artifact 会为可变换的 diagnostic holdout 同时保存 STATE 与 PLAN 诊断向量，因此同一个 holdout 历史可以依次运行 normal、STATE clamp 和 PLAN clamp；钳制命令需同时提供 `--clamp STATE|PLAN --anchors ... --example-id ...`。这些 holdout 向量不进入 Stage A-D 参数更新。
+
+### 原有协议工具
 
 计算冻结协议哈希：
 
@@ -135,4 +209,3 @@ tests/            离线单元与集成测试
 configs/          冻结协议示例
 docs/superpowers/plans/  实施计划
 ```
-

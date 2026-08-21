@@ -12,10 +12,17 @@ dependencies = [
   "pydantic>=2.8,<3",
   "PyYAML>=6,<7",
   "openai>=1.40,<3",
+  "tqdm>=4.66,<5",
 ]
 
 [project.optional-dependencies]
-train = ["torch>=2.4,<3"]
+train = [
+  "torch>=2.6,<3",
+  "transformers>=4.57,<5",
+  "peft>=0.19,<1",
+  "bitsandbytes>=0.49,<1",
+  "safetensors>=0.8,<1",
+]
 test = ["pytest>=8,<10"]
 
 [project.scripts]
@@ -27,4 +34,3 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
-

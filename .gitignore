@@ -7,4 +7,13 @@ build/
 *.egg-info/
 .venv/
 outputs/
+cache/
+docs
+.gitnexus/
+.codex/
+.claude/
+.agents/
+.superpowers/
+runs/
+tests/
 

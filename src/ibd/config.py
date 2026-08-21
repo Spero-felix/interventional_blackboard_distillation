@@ -2,10 +2,26 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
+
+
+ANCHOR_PROTOCOL_VERSION = "compact-v2"
+STATE_TOKEN_LIMIT = 128
+ANCHOR_SERIALIZER_VERSION = "canonical-json-v1"
+STRATEGY_CATALOG = (
+    "Question",
+    "Restatement or Paraphrasing",
+    "Reflection of feelings",
+    "Self-disclosure",
+    "Affirmation and Reassurance",
+    "Providing Suggestions",
+    "Information",
+    "Others",
+)
 
 
 class ModelConfig(BaseModel):
@@ -13,13 +29,24 @@ class ModelConfig(BaseModel):
     model: str
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     max_tokens: int = Field(default=1024, gt=0)
+    supports_seed: bool = False
+    provider_json_mode: bool = True
+    thinking_enabled: bool | None = None
 
 
 class BackendConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     base_url: str | None = None
+    base_url_env: str = "OPENAI_BASE_URL"
     api_key_env: str = "OPENAI_API_KEY"
     timeout_seconds: float = Field(default=60.0, gt=0)
+    cache_dir: Path | None = None
+
+    def resolve_base_url(self) -> str | None:
+        value = self.base_url or os.environ.get(self.base_url_env)
+        if value is None:
+            return None
+        return value.strip() or None
 
 
 class AppConfig(BaseModel):
@@ -39,4 +66,3 @@ class AppConfig(BaseModel):
 
     def for_role(self, role: str) -> ModelConfig:
         return self.roles.get(role, self.default_model)
-

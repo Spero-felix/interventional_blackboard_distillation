@@ -3,9 +3,121 @@
 from __future__ import annotations
 
 import math
+from collections import Counter
 from collections.abc import Mapping, Sequence
 
+from .schemas import STATE_ANCHOR_FIELDS
+
 Matrix = Mapping[str, Mapping[str, float]]
+
+
+def aggregate_causal_metrics(
+    observations: Sequence[Mapping[str, object]],
+) -> dict[str, dict[str, float | int | None]]:
+    """Aggregate symmetric clamp observations without merging STATE and PLAN."""
+
+    result: dict[str, dict[str, float | int | None]] = {}
+    for function in ("STATE", "PLAN"):
+        rows = [row for row in observations if row.get("function") == function]
+        if not rows:
+            result[function] = {
+                "pairs": 0,
+                "original_clamp_preference_accuracy": None,
+                "counterfactual_clamp_preference_accuracy": None,
+                "flip_consistency": None,
+                "non_target_slot_invariance_rate": None,
+            }
+            continue
+        original_correct = [
+            float(row["original_clamp_original_score"])
+            > float(row["original_clamp_counterfactual_score"])
+            for row in rows
+        ]
+        counterfactual_correct = [
+            float(row["counterfactual_clamp_counterfactual_score"])
+            > float(row["counterfactual_clamp_original_score"])
+            for row in rows
+        ]
+        count = len(rows)
+        result[function] = {
+            "pairs": count,
+            "original_clamp_preference_accuracy": sum(original_correct) / count,
+            "counterfactual_clamp_preference_accuracy": (
+                sum(counterfactual_correct) / count
+            ),
+            "flip_consistency": sum(
+                left and right
+                for left, right in zip(
+                    original_correct, counterfactual_correct, strict=True
+                )
+            )
+            / count,
+            "non_target_slot_invariance_rate": sum(
+                bool(row["non_target_slot_invariant"]) for row in rows
+            )
+            / count,
+        }
+    invalid = {row.get("function") for row in observations} - {"STATE", "PLAN"}
+    if invalid:
+        raise ValueError("causal observations must use STATE or PLAN")
+    return result
+
+
+def aggregate_intervention_audit(
+    audit_rows: Sequence[Mapping[str, object]],
+    *,
+    planner_strategies: Mapping[str, Sequence[str]],
+) -> dict[str, dict[str, object]]:
+    """Summarize Stage C attempts, including PLAN catalog-fallback usage."""
+
+    result: dict[str, dict[str, object]] = {}
+    for function in ("STATE", "PLAN"):
+        rows = [row for row in audit_rows if row.get("function") == function]
+        eligibility = Counter(str(row.get("eligibility")) for row in rows)
+        status = Counter(str(row.get("status")) for row in rows)
+        reasons = Counter(
+            str(row["exclusion_reason"])
+            for row in rows
+            if row.get("exclusion_reason") is not None
+        )
+        common: dict[str, object] = {
+            "attempted": len(rows),
+            "eligibility": {
+                "eligible": eligibility["eligible"],
+                "ineligible": eligibility["ineligible"],
+            },
+            "status": {
+                "retained": status["retained"],
+                "excluded": status["excluded"],
+            },
+            "exclusion_reasons": dict(sorted(reasons.items())),
+        }
+        if function == "STATE":
+            coverage = Counter(
+                str(row["state_field"])
+                for row in rows
+                if row.get("state_field") is not None
+            )
+            common["field_coverage"] = {
+                field: coverage[field] for field in STATE_ANCHOR_FIELDS
+            }
+        else:
+            fallback_count = 0
+            for row in rows:
+                example_id = str(row["example_id"])
+                planned = set(planner_strategies.get(example_id, ()))
+                counterfactual = row.get("counterfactual_plan_categories") or ()
+                if any(str(category) not in planned for category in counterfactual):
+                    fallback_count += 1
+            common["fallback_count"] = fallback_count
+            common["fallback_frequency"] = (
+                fallback_count / len(rows) if rows else None
+            )
+        result[function] = common
+    invalid = {row.get("function") for row in audit_rows} - {"STATE", "PLAN"}
+    if invalid:
+        raise ValueError("intervention audit rows must use STATE or PLAN")
+    return result
 
 
 def retention(
@@ -135,4 +247,3 @@ def mean_rank_gap(chosen: Sequence[float], rejected: Sequence[float]) -> float:
         chosen_score - rejected_score
         for chosen_score, rejected_score in zip(chosen, rejected, strict=True)
     ) / len(chosen)
-
