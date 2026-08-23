@@ -64,6 +64,8 @@ class ScriptedBackend:
                 "main_constraint": "担心对方继续回避",
                 "relationship_context": "亲密关系中的沟通僵局",
             }
+        if role == "state_counterfactual_generator":
+            return {"replacement": "准备立即采取具体行动"}
         if role == "planner":
             return {
                 "strategies": [

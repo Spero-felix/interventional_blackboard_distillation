@@ -8,7 +8,7 @@ build/
 .venv/
 outputs/
 cache/
-docs
+docs/
 .gitnexus/
 .codex/
 .claude/

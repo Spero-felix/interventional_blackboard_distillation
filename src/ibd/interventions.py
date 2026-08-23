@@ -51,6 +51,7 @@ class PairVerdict(StrictModel):
 
 ExclusionReason = Literal[
     "state_not_single_field",
+    "invalid_state_counterfactual",
     "plan_cardinality",
     "plan_overlap",
     "bidirectional_disagreement",
@@ -114,6 +115,41 @@ def mask_state_field(
         field=field,
         before=before,
         after=MASKED_STATE_VALUE,
+    )
+
+
+def replace_state_field(
+    state: StateBlackboard,
+    field: StateField,
+    replacement: str,
+) -> tuple[StateBlackboard, Mutation]:
+    if not isinstance(replacement, str):
+        raise ValueError("contrastive STATE replacement must be text")
+    normalized = " ".join(replacement.split())
+    if not normalized:
+        raise ValueError("contrastive STATE replacement must not be empty")
+    if normalized == MASKED_STATE_VALUE:
+        raise ValueError("contrastive STATE replacement must not use <MASKED>")
+
+    before = getattr(state, field)
+    if normalized == before:
+        raise ValueError("contrastive STATE replacement must differ from the original")
+
+    payload = state.model_dump(mode="json")
+    payload[field] = normalized
+    mutated = StateBlackboard.model_validate(payload)
+    changed = {
+        key
+        for key, value in state.model_dump(mode="json").items()
+        if mutated.model_dump(mode="json")[key] != value
+    }
+    if changed != {field}:
+        raise ValueError("contrastive STATE replacement must change exactly one field")
+    return mutated, Mutation(
+        operation="replace_state_field",
+        field=field,
+        before=before,
+        after=getattr(mutated, field),
     )
 
 
@@ -181,7 +217,33 @@ class InterventionBuilder:
                 for field in STATE_ANCHOR_FIELDS
             ):
                 raise InterventionExcluded("state_not_single_field")
-            state, mutation = mask_state_field(trace.state, state_field)
+            dimension: NonSafetyDimension = {
+                "emotion": "emotion",
+                "intensity": "emotion",
+                "primary_need": "need",
+                "support_goal": "intent",
+                "readiness": "timing",
+                "main_constraint": "effectiveness",
+                "relationship_context": "relationship",
+            }[state_field]
+            replacement = self.runner.generate_state_counterfactual(
+                trace.history,
+                trace.state,
+                state_field,
+                dimension,
+                example_id=(
+                    f"{trace.example_id}:intervention:STATE:"
+                    f"{state_field}:counterfactual"
+                ),
+            )
+            try:
+                state, mutation = replace_state_field(
+                    trace.state,
+                    state_field,
+                    replacement,
+                )
+            except ValueError as error:
+                raise InterventionExcluded("invalid_state_counterfactual") from error
             changed = {
                 key
                 for key, value in trace.state.model_dump(mode="json").items()
@@ -193,17 +255,10 @@ class InterventionBuilder:
             downstream = self.runner.rerun_downstream(
                 trace.history,
                 state,
-                example_id=f"{trace.example_id}:intervention:STATE",
+                example_id=(
+                    f"{trace.example_id}:intervention:STATE:{state_field}"
+                ),
             )
-            dimension: NonSafetyDimension = {
-                "emotion": "emotion",
-                "intensity": "emotion",
-                "primary_need": "need",
-                "support_goal": "intent",
-                "readiness": "timing",
-                "main_constraint": "effectiveness",
-                "relationship_context": "relationship",
-            }[state_field]
         else:
             used = PlanSelection.from_final_answer(trace.final_answer)
             selection, mutation = select_counterfactual_plan(
@@ -224,7 +279,7 @@ class InterventionBuilder:
                 selection=selection,
                 reusable_candidates=trace.candidates,
             )
-            dimension = "timing"
+            dimension = "effectiveness"
         counterfactual_response = downstream.final_answer.response
         if not self.verify_safety(trace.final_response, counterfactual_response):
             raise InterventionExcluded("safety_failure")

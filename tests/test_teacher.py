@@ -200,6 +200,81 @@ def test_each_expert_prompt_sees_history_but_no_peer_output(history, app_config)
     assert "decision_stage" not in prompts["need_expert"]
 
 
+def test_state_counterfactual_generator_sends_complete_localized_prompt_contract(
+    history, app_config
+):
+    from ibd.schemas import STATE_ANCHOR_FIELDS
+
+    class CounterfactualBackend(ScriptedBackend):
+        def _payload(self, role, seed):
+            if role == "state_counterfactual_generator":
+                return {"replacement": "ready to take immediate action"}
+            return super()._payload(role, seed)
+
+    backend = CounterfactualBackend()
+    runner = TeacherRunner(backend, app_config)
+    trace = runner.run("e-counterfactual-source", history)
+    backend.calls.clear()
+
+    replacement = runner.generate_state_counterfactual(
+        history,
+        trace.state,
+        "readiness",
+        "timing",
+        example_id="e-counterfactual:intervention:STATE:readiness:counterfactual",
+    )
+
+    assert replacement == "ready to take immediate action"
+    assert [call["role"] for call in backend.calls] == [
+        "state_counterfactual_generator"
+    ]
+    messages = backend.calls[0]["messages"]
+    system_prompt = messages[0]["content"]
+    payload = json.loads(messages[1]["content"])
+    context = payload["context"]
+
+    assert payload["history"] == history.model_dump(mode="json")
+    assert context == {
+        "state": trace.state.model_dump(mode="json"),
+        "target_field": "readiness",
+        "target_dimension": "timing",
+        "original_value": trace.state.readiness,
+    }
+    for field in STATE_ANCHOR_FIELDS:
+        assert f"`{field}`" in system_prompt
+    for required_concept in (
+        "plausible",
+        "contrastive",
+        "less supported",
+        "localized",
+        "<MASKED>",
+        "missingness",
+        "simple negation",
+        "strategy names",
+        "final response wording",
+        "diagnosis",
+        "invented events",
+        "explanation",
+    ):
+        assert required_concept in system_prompt
+    schema = json.loads(system_prompt.split("\n\nJSON Schema:\n", 1)[1])
+    assert set(schema["properties"]) == {"replacement"}
+    assert set(schema["required"]) == {"replacement"}
+
+
+def test_deepseek_teacher_configures_counterfactual_generator_deterministically():
+    from ibd.config import AppConfig
+
+    config = AppConfig.from_yaml("configs/deepseek_teacher.yaml")
+    role = config.roles["state_counterfactual_generator"]
+
+    assert role.model == "deepseek-v4-pro"
+    assert role.temperature == 0.0
+    assert role.max_tokens == 300
+    assert role.provider_json_mode is True
+    assert role.thinking_enabled is False
+
+
 @pytest.mark.parametrize(
     ("role", "field_keys"),
     [
@@ -910,6 +985,58 @@ def test_schema_retry_doubles_token_budget_after_invalid_json():
     assert [record.schema_retry for record in records] == [False, True]
 
 
+def test_structured_caller_disables_provider_json_mode_for_final_integrator_after_invalid_json():
+    from ibd.backend import LLMResult, StructuredCaller
+    from ibd.config import AppConfig, ModelConfig
+    from ibd.teacher import FinalAnswer
+
+    class InvalidThenValidBackend:
+        def __init__(self):
+            self.provider_json_mode = []
+
+        def complete(self, *, model_config, **kwargs):
+            self.provider_json_mode.append(model_config.provider_json_mode)
+            if len(self.provider_json_mode) == 1:
+                return LLMResult(text="not json at all")
+            return LLMResult(
+                text='{"response":"recovered","strategy_uses":[{"strategy_id":"S1","strategy":"Question","contribution":"Invites reflection."}]}'
+            )
+
+    backend = InvalidThenValidBackend()
+    config = AppConfig(
+        default_model=ModelConfig(model="fake-model", max_tokens=1000),
+        schema_retries=1,
+    )
+
+    parsed, records = StructuredCaller(backend, config).call(
+        "final_integrator",
+        [{"role": "user", "content": "Return JSON"}],
+        FinalAnswer,
+    )
+
+    assert parsed.response == "recovered"
+    assert backend.provider_json_mode == [True, False]
+    assert [record.schema_retry for record in records] == [False, True]
+
+
+def test_teacher_wraps_plain_text_final_response_with_strategy_metadata(history, app_config):
+    class PlainTextBackend(ScriptedBackend):
+        def _payload(self, role, seed):
+            payload = super()._payload(role, seed)
+            if role == "final_integrator":
+                return "A concise natural-language supporter response."
+            return payload
+
+    trace = TeacherRunner(PlainTextBackend(), app_config).run(
+        "e-plain-final-response", history
+    )
+
+    assert trace.final_answer.response == "A concise natural-language supporter response."
+    assert len(trace.final_answer.strategy_uses) == 1
+    assert trace.final_answer.strategy_uses[0].strategy_id == "S1"
+    assert trace.final_answer.strategy_uses[0].strategy == trace.plan.strategies[0]
+
+
 def test_structured_caller_retries_empty_provider_content(monkeypatch):
     from types import SimpleNamespace
 
@@ -996,3 +1123,26 @@ def test_schema_retry_keeps_token_budget_after_schema_validation_error():
     )
 
     assert backend.max_tokens == [1000, 1000]
+
+def test_teacher_canonicalizes_final_strategy_name_from_strategy_id(
+    history, app_config
+):
+    class WrongFinalStrategyNameBackend(ScriptedBackend):
+        def _payload(self, role, seed):
+            payload = super()._payload(role, seed)
+            if role == "final_integrator":
+                # S1 actually corresponds to "Reflection of feelings",
+                # but simulate the LLM returning a wrong redundant label.
+                payload["strategy_uses"][0]["strategy"] = "Information"
+            return payload
+
+    trace = TeacherRunner(
+        WrongFinalStrategyNameBackend(),
+        app_config,
+    ).run("e-wrong-final-strategy-name", history)
+
+    assert trace.final_answer.strategy_uses[0].strategy_id == "S1"
+    assert (
+        trace.final_answer.strategy_uses[0].strategy
+        == "Reflection of feelings"
+    )

@@ -10,6 +10,7 @@ from ibd.schemas import (
     InterventionRecord,
     MarginPair,
     Mutation,
+    StateCounterfactual,
     StrategyUse,
 )
 
@@ -73,6 +74,14 @@ def test_intervention_function_is_only_state_or_plan():
             localized_degradation=True,
             bidirectional_verified=True,
         )
+
+
+def test_state_counterfactual_has_replacement_only_contract():
+    value = StateCounterfactual(replacement="ready to take immediate action")
+
+    assert value.model_dump() == {"replacement": "ready to take immediate action"}
+    with pytest.raises(ValidationError):
+        StateCounterfactual(replacement="different value", rationale="not allowed")
 
 
 def test_margin_pair_rejects_safety_as_training_dimension():

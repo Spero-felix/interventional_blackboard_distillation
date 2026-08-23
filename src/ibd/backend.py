@@ -86,13 +86,18 @@ class OpenAIBackend:
         content = (message.content or "").strip()
         if not content:
             reasoning_content = getattr(message, "reasoning_content", None)
+            refusal = getattr(message, "refusal", None)
             usage = getattr(response, "usage", None)
+
             raise EmptyContentError(
                 f"{role} returned empty content "
                 f"(finish_reason={getattr(choice, 'finish_reason', None)!r}, "
+                f"refusal={refusal!r}, "
                 f"reasoning_content_present={bool(reasoning_content)}, "
                 f"reasoning_chars={len(reasoning_content or '')}, "
-                f"completion_tokens={int(getattr(usage, 'completion_tokens', 0) or 0)})"
+                f"completion_tokens="
+                f"{int(getattr(usage, 'completion_tokens', 0) or 0)}, "
+                f"message={message.model_dump(exclude_none=True)!r})"
             )
         usage = response.usage.model_dump() if response.usage else {}
         return LLMResult(text=content, usage=usage)
@@ -183,8 +188,15 @@ class StructuredCaller:
         records: list[CallRecord] = []
         current_messages = list(messages)
         last_error: Exception | None = None
+        disable_provider_json_mode = False
         for index in range(self.config.schema_retries + 1):
             model_config = self.config.for_role(role)
+
+            if disable_provider_json_mode:
+                model_config = model_config.model_copy(
+                    update={"provider_json_mode": False}
+                )
+
             if index > 0 and isinstance(last_error, json.JSONDecodeError):
                 model_config = model_config.model_copy(
                     update={"max_tokens": model_config.max_tokens * 2}
@@ -199,15 +211,55 @@ class StructuredCaller:
                 )
             except EmptyContentError as exc:
                 last_error = exc
+
                 if index >= self.config.schema_retries:
                     raise
-                current_messages = [
-                    *messages,
-                    {
-                        "role": "user",
-                        "content": "The previous response was empty. Return a non-empty JSON object matching the requested schema.",
-                    },
-                ]
+
+                # Provider-specific recovery:
+                # json_object mode can occasionally produce whitespace-only output.
+                # For final_integrator, fall back to normal text generation but keep
+                # strict JSON requirements in the prompt and Pydantic validation.
+                if role == "final_integrator" and model_config.provider_json_mode:
+                    disable_provider_json_mode = True
+
+                    current_messages = [
+                        *messages,
+                        {
+                            "role": "user",
+                            "content": (
+                                "The previous provider-enforced JSON response contained only "
+                                "whitespace. Retry WITHOUT answering the seeker directly outside "
+                                "the JSON object.\n\n"
+                                "Your FIRST non-whitespace character MUST be `{` and your LAST "
+                                "non-whitespace character MUST be `}`.\n\n"
+                                "Return exactly one JSON object in this form:\n"
+                                "{\n"
+                                '  "response": "<final supporter response>",\n'
+                                '  "strategy_uses": [\n'
+                                "    {\n"
+                                '      "strategy_id": "<supplied S1/S2/S3>",\n'
+                                '      "strategy": "<exact supplied strategy name>",\n'
+                                '      "contribution": "<brief concrete contribution>"\n'
+                                "    }\n"
+                                "  ]\n"
+                                "}\n\n"
+                                "Use one or two strategy_uses as permitted by the supplied schema. "
+                                "Do not use Markdown. Do not use code fences. Do not add explanation."
+                            ),
+                        },
+                    ]
+                else:
+                    current_messages = [
+                        *messages,
+                        {
+                            "role": "user",
+                            "content": (
+                                "The previous response was empty. "
+                                "Return a non-empty JSON object matching the requested schema."
+                            ),
+                        },
+                    ]
+
                 continue
             try:
                 payload = json.loads(result.text)
@@ -226,13 +278,42 @@ class StructuredCaller:
                 )
                 if index >= self.config.schema_retries:
                     break
-                current_messages = [
-                    *messages,
-                    {
-                        "role": "user",
-                        "content": f"Previous output violated the JSON schema: {exc}. Return corrected JSON only.",
-                    },
-                ]
+                if role == "final_integrator" and model_config.provider_json_mode:
+                    disable_provider_json_mode = True
+                    current_messages = [
+                        *messages,
+                        {
+                            "role": "user",
+                            "content": (
+                                "The previous provider-enforced JSON response was not valid "
+                                f"JSON: {exc}. Retry WITHOUT answering the seeker directly "
+                                "outside the JSON object.\n\n"
+                                "Your FIRST non-whitespace character MUST be `{` and your LAST "
+                                "non-whitespace character MUST be `}`.\n\n"
+                                "Return exactly one JSON object in this form:\n"
+                                "{\n"
+                                '  "response": "<final supporter response>",\n'
+                                '  "strategy_uses": [\n'
+                                "    {\n"
+                                '      "strategy_id": "<supplied S1/S2/S3>",\n'
+                                '      "strategy": "<exact supplied strategy name>",\n'
+                                '      "contribution": "<brief concrete contribution>"\n'
+                                "    }\n"
+                                "  ]\n"
+                                "}\n\n"
+                                "Use one or two strategy_uses as permitted by the supplied schema. "
+                                "Do not use Markdown. Do not use code fences. Do not add explanation."
+                            ),
+                        },
+                    ]
+                else:
+                    current_messages = [
+                        *messages,
+                        {
+                            "role": "user",
+                            "content": f"Previous output violated the JSON schema: {exc}. Return corrected JSON only.",
+                        },
+                    ]
                 continue
             records.append(
                 CallRecord(

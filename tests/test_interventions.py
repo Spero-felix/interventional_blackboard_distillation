@@ -112,6 +112,44 @@ def test_mask_state_field_changes_only_the_assigned_field(
     assert restored.model_dump_json() == before
 
 
+@pytest.mark.parametrize("field", STATE_ANCHOR_FIELDS)
+def test_replace_state_field_changes_only_target_and_records_contrast(
+    history, app_config, field
+):
+    from ibd.interventions import replace_state_field
+
+    trace = TeacherRunner(ScriptedBackend(), app_config).run("e-replace", history)
+    replacement = f"contrastive {field} value"
+    mutated, mutation = replace_state_field(trace.state, field, replacement)
+
+    assert _top_level_changes(trace.state, mutated) == {field}
+    assert getattr(mutated, field) == replacement
+    assert mutation.operation == "replace_state_field"
+    assert mutation.field == field
+    assert mutation.before == getattr(trace.state, field)
+    assert mutation.after == replacement
+
+
+@pytest.mark.parametrize(
+    ("replacement", "message"),
+    [
+        ("  失落  ", "must differ"),
+        ("<MASKED>", "must not use"),
+        (" \n\t ", "must not be empty"),
+        (" ".join(f"word{index}" for index in range(21)), "at most 20 words"),
+    ],
+)
+def test_replace_state_field_rejects_invalid_contrasts(
+    history, app_config, replacement, message
+):
+    from ibd.interventions import replace_state_field
+
+    trace = TeacherRunner(ScriptedBackend(), app_config).run("e-invalid", history)
+
+    with pytest.raises(ValueError, match=message):
+        replace_state_field(trace.state, "emotion", replacement)
+
+
 @pytest.mark.parametrize("used_count", [1, 2])
 def test_counterfactual_plan_prefers_planned_unused_and_preserves_count(used_count):
     from ibd.interventions import select_counterfactual_plan
@@ -253,6 +291,99 @@ def test_intervention_builder_rejects_a_second_state_mask(history, app_config):
             global_seed=17,
         )
     assert caught.value.reason == "state_not_single_field"
+
+
+def test_intervention_builder_uses_one_field_qualified_contrastive_replacement(
+    history, app_config
+):
+    from ibd.interventions import EffectVerification, InterventionBuilder
+
+    class RecordingRunner(TeacherRunner):
+        def __init__(self, backend, config):
+            super().__init__(backend, config)
+            self.counterfactual_ids = []
+
+        def generate_state_counterfactual(
+            self,
+            history,
+            state,
+            target_field,
+            target_dimension,
+            *,
+            example_id,
+        ):
+            self.counterfactual_ids.append(example_id)
+            return "准备立即采取具体行动"
+
+    trace = TeacherRunner(ScriptedBackend(), app_config).run("e-state-build", history)
+    downstream_backend = ScriptedBackend()
+    runner = RecordingRunner(downstream_backend, app_config)
+
+    record = InterventionBuilder(
+        runner,
+        lambda full, changed, dimension: EffectVerification(passed=True),
+        lambda full, changed: True,
+    ).build(
+        trace,
+        "STATE",
+        state_field="readiness",
+        global_seed=17,
+    )
+
+    assert runner.counterfactual_ids == [
+        "e-state-build:intervention:STATE:readiness:counterfactual"
+    ]
+    assert record.mutation.operation == "replace_state_field"
+    assert record.mutation.before == trace.state.readiness
+    assert record.mutation.after == "准备立即采取具体行动"
+    assert record.mutated_state.readiness == "准备立即采取具体行动"
+    assert "<MASKED>" not in record.mutated_state.model_dump(mode="json").values()
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        "  愿意探索  ",
+        "<MASKED>",
+        " ",
+        " ".join(f"word{index}" for index in range(21)),
+    ],
+)
+def test_intervention_builder_excludes_invalid_state_counterfactual_before_downstream(
+    history, app_config, replacement
+):
+    from ibd.interventions import (
+        EffectVerification,
+        InterventionBuilder,
+        InterventionExcluded,
+    )
+
+    class InvalidCounterfactualBackend(ScriptedBackend):
+        def _payload(self, role, seed):
+            if role == "state_counterfactual_generator":
+                return {"replacement": replacement}
+            return super()._payload(role, seed)
+
+    trace = TeacherRunner(ScriptedBackend(), app_config).run("e-invalid-cf", history)
+    backend = InvalidCounterfactualBackend()
+    builder = InterventionBuilder(
+        TeacherRunner(backend, app_config),
+        lambda full, changed, dimension: EffectVerification(passed=True),
+        lambda full, changed: True,
+    )
+
+    with pytest.raises(InterventionExcluded) as caught:
+        builder.build(
+            trace,
+            "STATE",
+            state_field="readiness",
+            global_seed=17,
+        )
+
+    assert caught.value.reason == "invalid_state_counterfactual"
+    assert [call["role"] for call in backend.calls] == [
+        "state_counterfactual_generator"
+    ]
 
 
 def test_intervention_builder_raises_stable_verifier_reason(history, app_config):

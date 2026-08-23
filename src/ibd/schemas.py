@@ -116,9 +116,11 @@ class StateBlackboard(StrictModel):
         values = [getattr(self, field) for field in STATE_ANCHOR_FIELDS]
         if values.count(MASKED_STATE_VALUE) > 1:
             raise ValueError("STATE may contain only a single <MASKED> value")
-        if len(set(values)) != len(values):
-            raise ValueError("STATE values must be distinct")
         return self
+
+
+class StateCounterfactual(StrictModel):
+    replacement: str
 
 
 class StrategyPlan(StrictModel):
@@ -249,7 +251,11 @@ class TeacherTrace(StrictModel):
 
 
 class Mutation(StrictModel):
-    operation: Literal["mask_state_field", "replace_plan_categories"]
+    operation: Literal[
+        "mask_state_field",
+        "replace_state_field",
+        "replace_plan_categories",
+    ]
     field: str
     before: object
     after: object
@@ -270,8 +276,8 @@ class InterventionRecord(StrictModel):
     @model_validator(mode="after")
     def function_matches_mutation(self) -> "InterventionRecord":
         if self.function == "STATE":
-            if self.mutation.operation != "mask_state_field":
-                raise ValueError("STATE intervention must mask a state field")
+            if self.mutation.operation != "replace_state_field":
+                raise ValueError("STATE intervention must replace a state field")
             if self.mutated_state is None or self.mutated_plan is not None:
                 raise ValueError("STATE intervention must carry only mutated_state")
         else:

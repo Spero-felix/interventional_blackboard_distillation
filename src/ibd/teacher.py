@@ -19,9 +19,11 @@ from .schemas import (
     ExpertOutput,
     FinalAnswer,
     History,
+    NonSafetyDimension,
     PlanSelection,
     SafetyCritiqueReport,
     StateBlackboard,
+    StateCounterfactual,
     StrictModel,
     StrategyName,
     StrategyPlanSet,
@@ -69,6 +71,10 @@ class _PlainTextJSONBackend:
         try:
             payload = json.loads(result.text)
         except json.JSONDecodeError:
+            # Preserve malformed JSON for StructuredCaller retries. Plain text
+            # is the only provider output that this compatibility layer wraps.
+            if result.text.lstrip().startswith(("{", "[")):
+                return result
             payload = None
         if isinstance(payload, dict):
             return result
@@ -136,6 +142,27 @@ class TeacherRunner:
                 _PlainTextJSONBackend(self.caller.backend, fixed_fields),
                 self.config,
             )
+        elif response_model is FinalAnswer and context is not None:
+            required_strategies = context.get("required_strategies")
+            if required_strategies is None:
+                plan = context.get("plan")
+                required_strategies = [plan.strategy_for_id("S1")] if plan else []
+            strategy_uses = [
+                {
+                    "strategy_id": f"S{index}",
+                    "strategy": strategy,
+                    "contribution": "Contributes to the final supporter response.",
+                }
+                for index, strategy in enumerate(required_strategies, start=1)
+            ][:2]
+            if strategy_uses:
+                caller = StructuredCaller(
+                    _PlainTextJSONBackend(
+                        self.caller.backend,
+                        {"strategy_uses": strategy_uses},
+                    ),
+                    self.config,
+                )
         parsed, new_records = caller.call(
             role,
             build_messages(role, history, response_model, context=context),
@@ -187,6 +214,31 @@ class TeacherRunner:
             final_response=downstream.response,
             call_records=records,
         )
+
+    def generate_state_counterfactual(
+        self,
+        history: History,
+        state: StateBlackboard,
+        target_field: str,
+        target_dimension: NonSafetyDimension,
+        *,
+        example_id: str,
+    ) -> str:
+        records: list[CallRecord] = []
+        result = self._call(
+            "state_counterfactual_generator",
+            history,
+            StateCounterfactual,
+            records,
+            context={
+                "state": state,
+                "target_field": target_field,
+                "target_dimension": target_dimension,
+                "original_value": getattr(state, target_field),
+            },
+            example_id=example_id,
+        )
+        return result.replacement
 
     def _run_from_state(
         self,
@@ -242,6 +294,31 @@ class TeacherRunner:
             example_id=example_id,
             plan=plan,
         )
+
+        # strategy_id is the model's actual selection.
+        # strategy name is redundant controller-owned metadata and should
+        # be canonicalized from the planner.
+        strategy_ids = [item.strategy_id for item in final.strategy_uses]
+
+        if len(strategy_ids) != len(set(strategy_ids)):
+            raise ValueError("final_integrator reused the same strategy_id")
+
+        canonical_strategy_uses = [
+            item.model_copy(
+                update={
+                    "strategy": plan.strategy_for_id(item.strategy_id),
+                }
+            )
+            for item in final.strategy_uses
+        ]
+
+        # Reconstruct through Pydantic so all FinalAnswer validators run again.
+        final = FinalAnswer(
+            response=final.response,
+            strategy_uses=canonical_strategy_uses,
+        )
+
+        # Keep this as a final sanity check.
         if any(
             plan.strategy_for_id(item.strategy_id) != item.strategy
             for item in final.strategy_uses
@@ -310,7 +387,8 @@ class TeacherRunner:
         records: list[CallRecord],
     ) -> Candidate:
         seed = self.config.candidate_seeds[local_index - 1]
-        return self._call(
+
+        candidate = self._call(
             f"candidate_{local_index}",
             history,
             Candidate,
@@ -324,6 +402,16 @@ class TeacherRunner:
             },
             seed=seed,
             example_id=example_id,
+        )
+
+        # Candidate metadata is controller-owned, not model-generated.
+        return candidate.model_copy(
+            update={
+                "candidate_id": str(local_index),
+                "strategy_id": f"S{local_index}",
+                "strategy": strategy,
+                "seed": seed,
+            }
         )
 
     def _run_critics(
@@ -428,11 +516,15 @@ class TeacherRunner:
     def _validate_selected_strategies(
         final_answer: FinalAnswer, selection: PlanSelection
     ) -> None:
-        actual = [item.strategy for item in final_answer.strategy_uses]
-        expected_ids = [f"S{index}" for index in range(1, len(selection.strategies) + 1)]
-        actual_ids = [item.strategy_id for item in final_answer.strategy_uses]
-        if actual != selection.strategies or actual_ids != expected_ids:
-            raise ValueError("final_integrator did not use exactly the selected strategies")
+        actual = {item.strategy for item in final_answer.strategy_uses}
+        expected = set(selection.strategies)
+        if (
+            len(final_answer.strategy_uses) != len(selection.strategies)
+            or actual != expected
+        ):
+            raise ValueError(
+                "final_integrator did not use exactly the selected strategies"
+            )
 
     def run_selected_strategies(
         self,

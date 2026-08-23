@@ -99,10 +99,14 @@ def test_sft_export_records_strategy_uses_outside_the_visible_prompt(history, ap
 
 def test_intervention_export_contains_only_student_visible_effect_fields(history, app_config):
     from ibd.export import intervention_row
-    from ibd.interventions import mask_state_field
+    from ibd.interventions import replace_state_field
 
     trace = TeacherRunner(ScriptedBackend(), app_config).run("e-int", history)
-    mutated_state, mutation = mask_state_field(trace.state, "emotion")
+    mutated_state, mutation = replace_state_field(
+        trace.state,
+        "emotion",
+        "calm but uncertain",
+    )
     record = InterventionRecord(
         example_id="e-int",
         function="STATE",

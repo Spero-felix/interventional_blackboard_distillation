@@ -1,4 +1,4 @@
-protocol_version: qwen25-socialsim-teacher-v1
+protocol_version: qwen25-socialsim-teacher-v2-role-prompts-2
 
 backend:
   base_url_env: OPENAI_BASE_URL
@@ -7,38 +7,44 @@ backend:
   cache_dir: cache/teacher-multistrategy
 
 default_model:
-  model: deepseek-v4-flash
+  model: deepseek-v4-pro
   temperature: 0.0
   max_tokens: 1200
   thinking_enabled: false
 
 roles:
+  state_counterfactual_generator:
+    model: deepseek-v4-pro
+    temperature: 0.0
+    max_tokens: 300
+    provider_json_mode: true
+    thinking_enabled: false
   candidate_1:
-    model: deepseek-v4-flash
+    model: deepseek-v4-pro
     temperature: 0.7
     max_tokens: 800
     provider_json_mode: false
     thinking_enabled: false
   candidate_2:
-    model: deepseek-v4-flash
+    model: deepseek-v4-pro
     temperature: 0.7
     max_tokens: 800
     provider_json_mode: false
     thinking_enabled: false
   candidate_3:
-    model: deepseek-v4-flash
+    model: deepseek-v4-pro
     temperature: 0.7
     max_tokens: 800
     provider_json_mode: false
     thinking_enabled: false
   final_integrator:
-    model: deepseek-v4-flash
+    model: deepseek-v4-pro
     temperature: 0.0
     max_tokens: 1200
-    provider_json_mode: false
+    provider_json_mode: true
     thinking_enabled: false
   emotion_critic:
-    model: deepseek-v4-flash
+    model: deepseek-v4-pro
     temperature: 0.0
     max_tokens: 1000
     thinking_enabled: false
