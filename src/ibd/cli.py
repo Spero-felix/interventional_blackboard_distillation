@@ -142,11 +142,19 @@ def _build_parser() -> argparse.ArgumentParser:
     generate_parser.add_argument("--output")
     generate_parser.add_argument("--max-new-tokens", type=int, default=256)
     generate_parser.add_argument("--device", type=int, default=0)
+
+    from .quality_cli import register_quality_commands
+
+    register_quality_commands(commands)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    from .quality_cli import QUALITY_COMMANDS, run_quality_command
+
+    if args.command in QUALITY_COMMANDS:
+        return run_quality_command(args)
     if args.command == "prepare-socialsim":
         from .socialsim import load_socialsim_files
 

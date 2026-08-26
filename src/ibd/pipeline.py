@@ -40,6 +40,7 @@ from .qwen import (
     QwenTrainingConfig,
     load_frozen_qwen_for_anchors,
     load_qwen_qlora,
+    restore_qwen_for_inference,
     validate_local_qwen_directory,
 )
 from .schemas import (
@@ -988,25 +989,12 @@ def _restore_for_inference(
     args: Namespace,
 ):
     config = QwenTrainingConfig.from_yaml(args.config)
-    loaded = load_qwen_qlora(config, device=args.device)
-    validate_local_qwen_directory(config.model_path)
-    payload = _checkpoint_payload(args.checkpoint)
-    manager = CheckpointManager(
-        Path(args.checkpoint).parent,
+    loaded = restore_qwen_for_inference(
+        config,
+        checkpoint=args.checkpoint,
         run_name=args.run_name,
-        seed=int(payload["metadata"]["seed"]),
+        device=args.device,
     )
-    manager.load(
-        args.checkpoint,
-        target_stage=payload["metadata"]["stage"],
-        model=loaded.model,
-        expected={
-            "slot_layer": config.slot_layer,
-            "special_token_ids": loaded.token_ids,
-        },
-        restore_rng=False,
-    )
-    loaded.slot_model.eval()
     return config, loaded
 
 

@@ -117,6 +117,31 @@ def encode_generation_prompt(
     }
 
 
+def encode_base_generation_prompt(
+    tokenizer: Any,
+    history: History | Mapping[str, Any],
+    *,
+    max_length: int,
+) -> dict[str, Any]:
+    """Encode the original Qwen chat prompt without Student-only IBD tokens."""
+
+    prompt_ids = list(
+        tokenizer.apply_chat_template(
+            history_messages(history),
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+    )
+    if len(prompt_ids) > max_length:
+        raise ValueError(
+            f"generation prompt exceeds max_length ({len(prompt_ids)} > {max_length})"
+        )
+    return {
+        "input_ids": torch.tensor([prompt_ids], dtype=torch.long),
+        "attention_mask": torch.ones((1, len(prompt_ids)), dtype=torch.long),
+    }
+
+
 class QwenStageCollator:
     """Right-pad one-response stage rows while retaining slot coordinates."""
 

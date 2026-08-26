@@ -125,6 +125,55 @@ CUDA_VISIBLE_DEVICES=0 $PY -m ibd.cli train-pipeline \
 
 这套指标回答的核心问题是：两个特殊 token 的隐状态是否真能作为可操纵的内部控制变量，而不是仅仅出现在输入中的装饰 token。
 
+## 生成质量对比
+
+生成质量评测与 Stage C 因果评测相互独立。它在同一组 `dev` 和
+`diagnostic_holdout` histories 上比较三类正常回复：训练后 Student、对应的
+原始 Qwen Instruct Base，以及已有 `TeacherTrace.final_response`。Teacher 回复
+直接复用，不重新运行 Teacher，因此不会产生额外 Teacher token 消耗。
+
+先复制并编辑 `configs/quality_eval.yaml`，尤其是 Student 的 checkpoint 和
+`run_name`。Base 始终从 Qwen training config 的 `model_path` 加载原始权重与原始
+tokenizer：不加载 LoRA/checkpoint，也不添加 `<|ibd_state|>`、
+`<|ibd_plan|>`；只有 Student 使用训练后的结构 token。
+
+```bash
+PY=/homeb/wangnianxiang/supervisor/.venv/bin/python
+export PYTHONPATH=src
+
+CUDA_VISIBLE_DEVICES=0 $PY -m ibd.cli quality-generate \
+  --config configs/quality_eval.yaml \
+  --traces artifacts/teacher/traces.jsonl \
+  --output-dir artifacts/quality/generation \
+  --device 0
+
+$PY -m ibd.cli quality-judge \
+  --config configs/quality_eval.yaml \
+  --responses artifacts/quality/generation/responses.jsonl \
+  --output-dir artifacts/quality/judge
+
+$PY -m ibd.cli quality-human-export \
+  --config configs/quality_eval.yaml \
+  --responses artifacts/quality/generation/responses.jsonl \
+  --output-dir artifacts/quality/human
+
+$PY -m ibd.cli quality-human-summarize \
+  --annotations artifacts/quality/human/pairs.csv \
+  --mapping artifacts/quality/human/private_mapping.jsonl \
+  --output artifacts/quality/human/report.json
+```
+
+前两个命令支持独立 artifact；生成与 Judge 还支持 `--resume` 和
+`--continue-on-error`。固定 Judge 对每条匿名回复分别给出 1–5 分的共情、相关性、
+连贯性、即时有效性和自主性评分，`overall` 由程序取五维算术平均。主报告分别呈现
+dev/holdout 的模型均值、覆盖率、同 history 配对分差以及胜/平/负比例，不包含安全
+维度或安全门槛。
+
+人工评审不是必经步骤。`quality-human-export` 生成匿名 A/B CSV 和单独的私有映射；
+评审者只需填写 `A`、`B` 或 `tie`。完成后才运行汇总命令。要增加另一个本地 Base
+或 Student checkpoint，可在 quality config 的 `models` 列表中添加唯一
+`model_id` 与相应 `response_source` 配置，Judge 无需修改。
+
 ## 目录
 
 ```text

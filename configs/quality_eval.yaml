@@ -1,0 +1,38 @@
+protocol_version: generation-quality-v1
+splits: [dev, diagnostic_holdout]
+
+models:
+  - model_id: teacher
+    source: teacher_trace
+  - model_id: base
+    source: base_qwen
+    training_config: qwen25_7b_qlora_3090.yaml
+  - model_id: student
+    source: student_checkpoint
+    training_config: qwen25_7b_qlora_3090.yaml
+    checkpoint: ../runs/seed-42/stage-C-step-0
+    run_name: seed-42
+
+generation:
+  max_new_tokens: 256
+  do_sample: false
+  seed: 42
+
+backend:
+  base_url_env: OPENAI_BASE_URL
+  api_key_env: OPENAI_API_KEY
+  timeout_seconds: 60
+
+judge:
+  model: deepseek-v4-flash
+  temperature: 0.0
+  max_tokens: 1200
+  supports_seed: false
+  provider_json_mode: true
+  thinking_enabled: false
+
+judge_seed: 4242
+judge_prompt_version: quality-judge-v1
+human_seed: 2026
+schema_retries: 1
+teacher_model: deepseek-v4-flash

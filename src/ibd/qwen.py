@@ -92,6 +92,12 @@ class FrozenQwen:
     token_ids: dict[str, int]
 
 
+@dataclass(frozen=True)
+class BaseQwen:
+    tokenizer: Any
+    model: torch.nn.Module
+
+
 def validate_local_qwen_directory(path: str | Path) -> dict[str, Any]:
     root = Path(path).resolve()
     required = (
@@ -304,3 +310,72 @@ def load_frozen_qwen_for_anchors(
     for parameter in model.parameters():
         parameter.requires_grad_(False)
     return FrozenQwen(tokenizer=tokenizer, model=model, token_ids=token_ids)
+
+
+def load_qwen_base_for_generation(
+    config: QwenTrainingConfig,
+    *,
+    device: int = 0,
+) -> BaseQwen:
+    """Load the untouched Qwen Instruct baseline without IBD vocabulary changes."""
+
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    model_path = str(config.model_path)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path,
+        local_files_only=True,
+        trust_remote_code=False,
+    )
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        local_files_only=True,
+        trust_remote_code=False,
+        torch_dtype=torch.bfloat16,
+        device_map={"": device},
+    )
+    _validate_loaded_architecture(model)
+    model.config.use_cache = True
+    model.eval()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    return BaseQwen(tokenizer=tokenizer, model=model)
+
+
+def restore_qwen_for_inference(
+    config: QwenTrainingConfig,
+    *,
+    checkpoint: str | Path,
+    run_name: str,
+    device: int = 0,
+) -> LoadedQwen:
+    """Load a trained Student checkpoint for deterministic inference."""
+
+    from .checkpointing import CheckpointManager, CheckpointMetadata
+
+    loaded = load_qwen_qlora(config, device=device)
+    validate_local_qwen_directory(config.model_path)
+    checkpoint_path = Path(checkpoint)
+    payload = json.loads(
+        (checkpoint_path / "checkpoint.json").read_text(encoding="utf-8")
+    )
+    metadata = CheckpointMetadata.model_validate(payload["metadata"])
+    manager = CheckpointManager(
+        checkpoint_path.parent,
+        run_name=run_name,
+        seed=metadata.seed,
+    )
+    manager.load(
+        checkpoint_path,
+        target_stage=metadata.stage,
+        model=loaded.model,
+        expected={
+            "slot_layer": config.slot_layer,
+            "special_token_ids": loaded.token_ids,
+        },
+        restore_rng=False,
+    )
+    loaded.slot_model.eval()
+    return loaded
