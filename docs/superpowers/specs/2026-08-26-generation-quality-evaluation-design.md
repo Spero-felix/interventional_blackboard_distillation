@@ -13,8 +13,10 @@ evaluation. It does not change, replace, or merge with the Stage C metrics.
 ## Fixed protocol
 
 - Each evaluated model produces exactly one normal response per history.
-- Student and Base use identical prompt encoding, truncation, and deterministic
-  decoding parameters.
+- Student and Base use the same history, chat template, history truncation
+  policy, and deterministic decoding parameters. Student receives its trained
+  `<|ibd_state|>` and `<|ibd_plan|>` structure tokens; the unmodified Base does
+  not receive newly added random token embeddings.
 - Teacher responses are read from `TeacherTrace.final_response`; the six-call
   Teacher pipeline is not rerun.
 - Results for `dev` and `diagnostic_holdout` are reported separately. A pooled
@@ -218,20 +220,16 @@ the model registry extensible to more local checkpoints.
 
 ## Verification
 
-Offline tests cover:
+Keep the offline suite focused on protocol-critical behavior rather than testing
+every field or error branch. Core tests cover:
 
-- strict response and five-dimension judgment schemas;
-- arithmetic computation of `overall`;
-- split isolation and same-history paired comparisons;
-- Teacher response reuse without a model call;
-- identical Base and Student prompt/decoding settings;
-- absence of model identity and safety language from Judge inputs;
-- structured-output retry, failure ledgers, non-overwrite behavior, and resume;
-- incomplete and inconsistent model coverage detection;
-- deterministic anonymous A/B assignment and within-group placement balance;
-- public artifact anonymity and private mapping correctness;
-- human preference validation and aggregation, including multiple reviewers;
-- a small scripted end-to-end workflow requiring neither a GPU nor a live API.
+- five-dimension `overall`, split isolation, and same-history paired summaries;
+- Teacher reuse plus the Base/Student structure-token boundary under shared
+  history formatting and decoding settings;
+- anonymous Judge input, absence of the safety dimension, and structured score
+  parsing;
+- deterministic blinded pair mapping and `A`/`B`/`tie` aggregation;
+- one scripted CLI smoke workflow requiring neither a GPU nor a live API.
 
 Real-model generation and live Judge calls remain explicit runtime smoke tests,
 not requirements for the offline test suite.
