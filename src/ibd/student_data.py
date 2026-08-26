@@ -181,7 +181,7 @@ class QwenStageCollator:
 
 
 class QwenPairCollator:
-    """Encode two response conditions without mixing their padding lengths."""
+    """Encode original/counterfactual responses without quality labels."""
 
     def __init__(
         self,
@@ -208,8 +208,8 @@ class QwenPairCollator:
 
     def __call__(self, examples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {
-            "chosen": self.left(examples),
-            "rejected": self.right(examples),
+            "original": self.left(examples),
+            "counterfactual": self.right(examples),
             "example_ids": [str(example["example_id"]) for example in examples],
         }
         if any("function" in example for example in examples):

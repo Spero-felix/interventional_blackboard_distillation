@@ -1,5 +1,4 @@
 import json
-import re
 
 import pytest
 import yaml
@@ -35,17 +34,6 @@ def _write_config(path):
         yaml.safe_dump({"default_model": {"model": "fake-model"}}),
         encoding="utf-8",
     )
-
-
-def test_protocol_hash_prints_one_lowercase_sha256_line(tmp_path, capsys):
-    from ibd.cli import main
-
-    config_path = tmp_path / "config.yaml"
-    _write_config(config_path)
-
-    assert main(["protocol-hash", "--config", str(config_path)]) == 0
-    output = capsys.readouterr().out.strip()
-    assert re.fullmatch(r"[0-9a-f]{64}", output)
 
 
 def test_validate_trace_accepts_a_complete_teacher_trace(
@@ -183,7 +171,7 @@ def test_export_student_writes_allowlisted_sft_rows(
         "example_id",
         "prompt",
         "response",
-        "strategy_uses",
+        "selected_strategy",
     }
     assert progress_calls == [
         {"desc": "export sft", "total": 1, "unit": "record", "postfix": []}
@@ -228,15 +216,12 @@ def test_cli_registers_complete_qwen_pipeline_command_surface():
             "traces.jsonl",
             "--output",
             "interventions.jsonl",
-            "--margins-output",
-            "margins.jsonl",
             "--manifest",
             "manifest.json",
             "--global-seed",
             "73",
         ]
     )
-    assert build_args.margins_output == "margins.jsonl"
     assert build_args.global_seed == 73
 
     anchor_args = parser.parse_args(
@@ -252,10 +237,13 @@ def test_cli_registers_complete_qwen_pipeline_command_surface():
             "73",
             "--diagnostic-state-field",
             "primary_need",
+            "--original-splits",
+            "dev",
         ]
     )
     assert anchor_args.global_seed == 73
     assert anchor_args.diagnostic_state_field == "primary_need"
+    assert anchor_args.original_splits == ["dev"]
 
     evaluate_args = parser.parse_args(
         [
@@ -270,8 +258,6 @@ def test_cli_registers_complete_qwen_pipeline_command_surface():
             "traces.jsonl",
             "--interventions",
             "interventions.jsonl",
-            "--margins",
-            "margins.jsonl",
             "--anchors",
             "anchors.safetensors",
             "--intervention-manifest",

@@ -1,10 +1,10 @@
-"""Four-expert Teacher controller with deterministic call accounting."""
+"""Unified multi-view Teacher with deterministic single-candidate selection."""
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Literal, Sequence
+from typing import Any, Literal
 
 from .backend import LLMBackend, LLMResult, StructuredCaller
 from .config import AppConfig, ModelConfig
@@ -12,16 +12,11 @@ from .prompting import build_messages
 from .schemas import (
     CallRecord,
     Candidate,
-    CritiqueReport,
-    EffectivenessCritiqueReport,
-    EmotionCritiqueReport,
-    ExpertName,
-    ExpertOutput,
-    FinalAnswer,
+    FinalSelection,
+    FinalSelectionDecision,
     History,
+    MultiViewStateAnalysis,
     NonSafetyDimension,
-    PlanSelection,
-    SafetyCritiqueReport,
     StateBlackboard,
     StateCounterfactual,
     StrictModel,
@@ -31,24 +26,17 @@ from .schemas import (
 )
 
 NORMAL_ROLES = (
-    "emotion_expert",
-    "need_expert",
-    "relationship_expert",
-    "intent_expert",
-    "state_integrator",
+    "multi_view_state_analyzer",
     "planner",
     "candidate_1",
     "candidate_2",
     "candidate_3",
-    "emotion_critic",
-    "effectiveness_critic",
-    "safety_critic",
-    "final_integrator",
+    "final_selector",
 )
 
 
 @dataclass(frozen=True)
-class _PlainTextJSONBackend:
+class _PlainTextCandidateBackend:
     backend: LLMBackend
     fixed_fields: dict[str, Any]
 
@@ -71,41 +59,36 @@ class _PlainTextJSONBackend:
         try:
             payload = json.loads(result.text)
         except json.JSONDecodeError:
-            # Preserve malformed JSON for StructuredCaller retries. Plain text
-            # is the only provider output that this compatibility layer wraps.
-            if result.text.lstrip().startswith(("{", "[")):
-                return result
             payload = None
         if isinstance(payload, dict):
             return result
+        if result.text.lstrip().startswith(("{", "[")):
+            return result
         response = payload if isinstance(payload, str) else result.text
-        wrapped = {**self.fixed_fields, "response": response}
         return LLMResult(
-            text=json.dumps(wrapped, ensure_ascii=False),
+            text=json.dumps(
+                {
+                    **self.fixed_fields,
+                    "response": response,
+                    "response_goal": "Support the seeker's immediate goal",
+                    "response_act": "Apply the assigned strategy",
+                },
+                ensure_ascii=False,
+            ),
             usage=result.usage,
         )
 
 
 @dataclass(frozen=True)
 class DownstreamResult:
-    final_answer: FinalAnswer
+    final_selection: FinalSelection
     plan: StrategyPlanSet
     candidates: list[Candidate]
-    critiques: list[CritiqueReport]
     call_records: list[CallRecord]
 
     @property
     def response(self) -> str:
-        return self.final_answer.response
-
-
-@dataclass(frozen=True)
-class SelectedDownstreamResult:
-    selection: PlanSelection
-    candidates: list[Candidate]
-    critiques: list[CritiqueReport]
-    final_answer: FinalAnswer
-    call_records: list[CallRecord]
+        return self.final_selection.response
 
 
 class TeacherRunner:
@@ -125,44 +108,17 @@ class TeacherRunner:
         example_id: str | None = None,
     ):
         caller = self.caller
-        if (
-            not self.config.for_role(role).provider_json_mode
-            and response_model is Candidate
-        ):
+        if not self.config.for_role(role).provider_json_mode and response_model is Candidate:
             required = {"candidate_id", "strategy_id", "strategy", "seed"}
             if context is None or not required.issubset(context):
                 raise ValueError(f"missing frozen candidate metadata for {role}")
-            fixed_fields = {
-                "candidate_id": context["candidate_id"],
-                "strategy_id": context["strategy_id"],
-                "strategy": context["strategy"],
-                "seed": context["seed"],
-            }
             caller = StructuredCaller(
-                _PlainTextJSONBackend(self.caller.backend, fixed_fields),
+                _PlainTextCandidateBackend(
+                    self.caller.backend,
+                    {field: context[field] for field in required},
+                ),
                 self.config,
             )
-        elif response_model is FinalAnswer and context is not None:
-            required_strategies = context.get("required_strategies")
-            if required_strategies is None:
-                plan = context.get("plan")
-                required_strategies = [plan.strategy_for_id("S1")] if plan else []
-            strategy_uses = [
-                {
-                    "strategy_id": f"S{index}",
-                    "strategy": strategy,
-                    "contribution": "Contributes to the final supporter response.",
-                }
-                for index, strategy in enumerate(required_strategies, start=1)
-            ][:2]
-            if strategy_uses:
-                caller = StructuredCaller(
-                    _PlainTextJSONBackend(
-                        self.caller.backend,
-                        {"strategy_uses": strategy_uses},
-                    ),
-                    self.config,
-                )
         parsed, new_records = caller.call(
             role,
             build_messages(role, history, response_model, context=context),
@@ -181,36 +137,25 @@ class TeacherRunner:
         split: Literal["train", "dev", "test", "diagnostic_holdout"] = "train",
     ) -> TeacherTrace:
         records: list[CallRecord] = []
-        expert_outputs: dict[ExpertName, ExpertOutput] = {}
-        for expert in ("emotion", "need", "relationship", "intent"):
-            output = self._call(
-                f"{expert}_expert", history, ExpertOutput, records, example_id=example_id
-            )
-            if output.expert != expert:
-                raise ValueError(f"expert metadata mismatch for {expert}_expert")
-            expert_outputs[expert] = output
-
-        state = self._call(
-            "state_integrator",
+        analysis = self._call(
+            "multi_view_state_analyzer",
             history,
-            StateBlackboard,
+            MultiViewStateAnalysis,
             records,
-            context={"expert_outputs": expert_outputs},
             example_id=example_id,
         )
-        downstream = self._run_from_state(history, state, records, example_id=example_id)
-
+        downstream = self._run_from_state(
+            history, analysis.state, records, example_id=example_id
+        )
         return TeacherTrace(
             example_id=example_id,
-            teacher_protocol_hash=self.caller.protocol_hash,
             split=split,
             history=history,
-            expert_outputs=expert_outputs,
-            state=state,
+            state_analysis=analysis,
+            state=analysis.state,
             plan=downstream.plan,
             candidates=downstream.candidates,
-            critiques=downstream.critiques,
-            final_answer=downstream.final_answer,
+            final_selection=downstream.final_selection,
             final_response=downstream.response,
             call_records=records,
         )
@@ -247,134 +192,40 @@ class TeacherRunner:
         records: list[CallRecord],
         *,
         example_id: str | None = None,
+        clamped_state_field: str | None = None,
     ) -> DownstreamResult:
+        context: dict[str, Any] = {"state": state}
+        if clamped_state_field is not None:
+            context["clamped_state_field"] = clamped_state_field
         plan = self._call(
             "planner",
             history,
             StrategyPlanSet,
             records,
-            context={"state": state},
+            context=context,
             example_id=example_id,
         )
-        return self._run_from_plan(history, state, plan, records, example_id=example_id)
-
-    def _run_from_plan(
-        self,
-        history: History,
-        state: StateBlackboard,
-        plan: StrategyPlanSet,
-        records: list[CallRecord],
-        *,
-        example_id: str | None = None,
-        frozen_candidates: list[Candidate] | None = None,
-        regenerate_strategy_ids: set[str] | None = None,
-    ) -> DownstreamResult:
-        candidates = self._run_candidates(
-            history=history,
-            state=state,
-            plan=plan,
-            records=records,
-            example_id=example_id,
-            frozen_candidates=frozen_candidates,
-            regenerate_strategy_ids=regenerate_strategy_ids,
-        )
-        critiques = self._run_critics(
-            history=history,
-            state=state,
-            candidates=candidates,
-            records=records,
-            example_id=example_id,
-        )
-        final = self._run_final_integrator(
-            history=history,
-            state=state,
-            candidates=candidates,
-            critiques=critiques,
-            records=records,
-            example_id=example_id,
-            plan=plan,
-        )
-
-        # strategy_id is the model's actual selection.
-        # strategy name is redundant controller-owned metadata and should
-        # be canonicalized from the planner.
-        strategy_ids = [item.strategy_id for item in final.strategy_uses]
-
-        if len(strategy_ids) != len(set(strategy_ids)):
-            raise ValueError("final_integrator reused the same strategy_id")
-
-        canonical_strategy_uses = [
-            item.model_copy(
-                update={
-                    "strategy": plan.strategy_for_id(item.strategy_id),
-                }
+        candidates = [
+            self._generate_candidate(
+                example_id=example_id,
+                history=history,
+                state=state,
+                strategy=plan.strategy_for_id(f"S{index}"),
+                local_index=index,
+                records=records,
+                clamped_state_field=clamped_state_field,
             )
-            for item in final.strategy_uses
+            for index in range(1, 4)
         ]
-
-        # Reconstruct through Pydantic so all FinalAnswer validators run again.
-        final = FinalAnswer(
-            response=final.response,
-            strategy_uses=canonical_strategy_uses,
+        final_selection = self._run_final_selector(
+            history=history,
+            state=state,
+            candidates=candidates,
+            records=records,
+            example_id=example_id,
+            clamped_state_field=clamped_state_field,
         )
-
-        # Keep this as a final sanity check.
-        if any(
-            plan.strategy_for_id(item.strategy_id) != item.strategy
-            for item in final.strategy_uses
-        ):
-            raise ValueError("final_integrator used a strategy not produced by planner")
-        return DownstreamResult(final, plan, candidates, critiques, records)
-
-    def _run_candidates(
-        self,
-        *,
-        history: History,
-        state: StateBlackboard,
-        plan: StrategyPlanSet,
-        records: list[CallRecord],
-        example_id: str | None,
-        frozen_candidates: Sequence[Candidate] | None = None,
-        regenerate_strategy_ids: set[str] | None = None,
-    ) -> list[Candidate]:
-        candidates: list[Candidate] = []
-        frozen_by_strategy = {
-            candidate.strategy: candidate for candidate in (frozen_candidates or [])
-        }
-        for index, seed in enumerate(self.config.candidate_seeds, start=1):
-            candidate_id = str(index)
-            strategy_id = f"S{index}"
-            strategy = plan.strategy_for_id(strategy_id)
-            candidate = frozen_by_strategy.get(strategy)
-            if candidate is None or (
-                regenerate_strategy_ids is not None
-                and strategy_id in regenerate_strategy_ids
-            ):
-                candidate = self._generate_candidate(
-                    example_id=example_id,
-                    history=history,
-                    state=state,
-                    strategy=strategy,
-                    local_index=index,
-                    records=records,
-                )
-            else:
-                candidate = candidate.model_copy(
-                    update={
-                        "candidate_id": candidate_id,
-                        "strategy_id": strategy_id,
-                        "seed": seed,
-                    }
-                )
-            if (
-                candidate.candidate_id != candidate_id
-                or candidate.seed != seed
-                or candidate.strategy_id != strategy_id
-                or candidate.strategy != strategy
-            ):
-                raise ValueError(f"candidate metadata mismatch for candidate_{index}")
-            candidates.append(candidate)
-        return candidates
+        return DownstreamResult(final_selection, plan, candidates, records)
 
     def _generate_candidate(
         self,
@@ -385,27 +236,28 @@ class TeacherRunner:
         strategy: StrategyName,
         local_index: int,
         records: list[CallRecord],
+        clamped_state_field: str | None = None,
     ) -> Candidate:
         seed = self.config.candidate_seeds[local_index - 1]
-
-        candidate = self._call(
+        context: dict[str, Any] = {
+            "state": state,
+            "candidate_id": str(local_index),
+            "strategy_id": f"S{local_index}",
+            "strategy": strategy,
+            "seed": seed,
+        }
+        if clamped_state_field is not None:
+            context["clamped_state_field"] = clamped_state_field
+        generated = self._call(
             f"candidate_{local_index}",
             history,
             Candidate,
             records,
-            context={
-                "state": state,
-                "candidate_id": str(local_index),
-                "strategy_id": f"S{local_index}",
-                "strategy": strategy,
-                "seed": seed,
-            },
+            context=context,
             seed=seed,
             example_id=example_id,
         )
-
-        # Candidate metadata is controller-owned, not model-generated.
-        return candidate.model_copy(
+        return generated.model_copy(
             update={
                 "candidate_id": str(local_index),
                 "strategy_id": f"S{local_index}",
@@ -414,7 +266,7 @@ class TeacherRunner:
             }
         )
 
-    def _run_critics(
+    def _run_final_selector(
         self,
         *,
         history: History,
@@ -422,192 +274,41 @@ class TeacherRunner:
         candidates: list[Candidate],
         records: list[CallRecord],
         example_id: str | None,
-    ) -> list[CritiqueReport]:
-        critiques: list[CritiqueReport] = []
-        critic_models = (
-            ("emotion_critic", EmotionCritiqueReport),
-            ("effectiveness_critic", EffectivenessCritiqueReport),
-            ("safety_critic", SafetyCritiqueReport),
-        )
-        for role, response_model in critic_models:
-            critique = self._call(
-                role,
-                history,
-                response_model,
-                records,
-                context={"state": state, "candidates": candidates},
-                example_id=example_id,
-            )
-            if critique.critic != role.removesuffix("_critic"):
-                raise ValueError(f"critic metadata mismatch for {role}")
-            expected_candidate_ids = {candidate.candidate_id for candidate in candidates}
-            if role == "safety_critic" and not critique.candidate_issues:
-                critique = critique.model_copy(
-                    update={
-                        "candidate_issues": {
-                            candidate_id: [] for candidate_id in expected_candidate_ids
-                        }
-                    }
-                )
-            if set(critique.candidate_issues) != expected_candidate_ids:
-                raise ValueError(f"critic candidate coverage mismatch for {role}")
-            critiques.append(critique)
-        return critiques
-
-    def _run_final_integrator(
-        self,
-        *,
-        history: History,
-        state: StateBlackboard,
-        candidates: list[Candidate],
-        critiques: list[CritiqueReport],
-        records: list[CallRecord],
-        example_id: str | None,
-        plan: StrategyPlanSet | None = None,
-        required_strategies: Sequence[StrategyName] | None = None,
-    ) -> FinalAnswer:
-        context: dict[str, Any] = {
-            "state": state,
-            "candidates": candidates,
-            "critiques": critiques,
-        }
-        if plan is not None:
-            context["plan"] = plan
-        if required_strategies is not None:
-            context["required_strategies"] = list(required_strategies)
-        return self._call(
-            "final_integrator",
+        clamped_state_field: str | None = None,
+    ) -> FinalSelection:
+        context: dict[str, Any] = {"state": state, "candidates": candidates}
+        if clamped_state_field is not None:
+            context["clamped_state_field"] = clamped_state_field
+        decision = self._call(
+            "final_selector",
             history,
-            FinalAnswer,
+            FinalSelectionDecision,
             records,
             context=context,
             example_id=example_id,
         )
-
-    def _reuse_or_generate_candidate(
-        self,
-        *,
-        example_id: str,
-        history: History,
-        state: StateBlackboard,
-        strategy: StrategyName,
-        local_index: int,
-        reusable: Candidate | None,
-        records: list[CallRecord],
-    ) -> Candidate:
-        if reusable is None:
-            return self._generate_candidate(
-                example_id=example_id,
-                history=history,
-                state=state,
-                strategy=strategy,
-                local_index=local_index,
-                records=records,
-            )
-        return reusable.model_copy(
-            update={
-                "candidate_id": str(local_index),
-                "strategy_id": f"S{local_index}",
-                "seed": self.config.candidate_seeds[local_index - 1],
-            }
-        )
-
-    @staticmethod
-    def _validate_selected_strategies(
-        final_answer: FinalAnswer, selection: PlanSelection
-    ) -> None:
-        actual = {item.strategy for item in final_answer.strategy_uses}
-        expected = set(selection.strategies)
-        if (
-            len(final_answer.strategy_uses) != len(selection.strategies)
-            or actual != expected
-        ):
-            raise ValueError(
-                "final_integrator did not use exactly the selected strategies"
-            )
-
-    def run_selected_strategies(
-        self,
-        *,
-        example_id: str,
-        history: History,
-        state: StateBlackboard,
-        selection: PlanSelection,
-        reusable_candidates: Sequence[Candidate],
-    ) -> SelectedDownstreamResult:
-        records: list[CallRecord] = []
-        reusable_by_strategy = {
-            candidate.strategy: candidate for candidate in reusable_candidates
-        }
-        candidates = [
-            self._reuse_or_generate_candidate(
-                example_id=example_id,
-                history=history,
-                state=state,
-                strategy=strategy,
-                local_index=index,
-                reusable=reusable_by_strategy.get(strategy),
-                records=records,
-            )
-            for index, strategy in enumerate(selection.strategies, start=1)
+        selected = [
+            candidate
+            for candidate in candidates
+            if candidate.candidate_id == decision.selected_candidate_id
         ]
-        critiques = self._run_critics(
-            history=history,
-            state=state,
-            candidates=candidates,
-            records=records,
-            example_id=example_id,
-        )
-        final_answer = self._run_final_integrator(
-            history=history,
-            state=state,
-            candidates=candidates,
-            critiques=critiques,
-            records=records,
-            example_id=example_id,
-            required_strategies=selection.strategies,
-        )
-        self._validate_selected_strategies(final_answer, selection)
-        return SelectedDownstreamResult(
-            selection=selection,
-            candidates=candidates,
-            critiques=critiques,
-            final_answer=final_answer,
-            call_records=records,
-        )
+        if len(selected) != 1:
+            raise ValueError("final_selector must identify exactly one supplied candidate")
+        return FinalSelection.from_candidate(selected[0], decision)
 
     def rerun_downstream(
         self,
         history: History,
         state: StateBlackboard,
-        plan: StrategyPlanSet | None = None,
         *,
         example_id: str | None = None,
+        clamped_state_field: str | None = None,
     ) -> DownstreamResult:
-        """Rerun only nodes downstream of a clamped STATE or PLAN."""
         records: list[CallRecord] = []
-        if plan is None:
-            return self._run_from_state(history, state, records, example_id=example_id)
-        return self._run_from_plan(history, state, plan, records, example_id=example_id)
-
-    def rerun_plan_intervention(
-        self,
-        history: History,
-        state: StateBlackboard,
-        plan: StrategyPlanSet,
-        original_candidates: list[Candidate],
-        changed_strategy_id: str,
-        *,
-        example_id: str | None = None,
-    ) -> DownstreamResult:
-        """Regenerate one affected candidate, then rerun critics and final integration."""
-        records: list[CallRecord] = []
-        return self._run_from_plan(
+        return self._run_from_state(
             history,
             state,
-            plan,
             records,
             example_id=example_id,
-            frozen_candidates=original_candidates,
-            regenerate_strategy_ids={changed_strategy_id},
+            clamped_state_field=clamped_state_field,
         )

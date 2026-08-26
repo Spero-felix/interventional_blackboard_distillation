@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,7 +11,6 @@ import torch
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .hashing import protocol_hash
 from .model import QwenSlotCausalLM
 from .student_data import IBD_PLAN_TOKEN, IBD_STATE_TOKEN, add_ibd_tokens
 
@@ -74,24 +72,6 @@ class QwenTrainingConfig(BaseModel):
         payload = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
         return cls.model_validate(payload)
 
-    @property
-    def config_hash(self) -> str:
-        return protocol_hash(self)
-
-    @property
-    def anchor_config_hash(self) -> str:
-        return protocol_hash(
-            {
-                "protocol_version": "qwen25-layer-anchor-v1",
-                "model_path": str(self.model_path.resolve()),
-                "slot_layer": self.slot_layer,
-                "anchor_dtype": "bfloat16",
-                "state_token": IBD_STATE_TOKEN,
-                "plan_token": IBD_PLAN_TOKEN,
-            }
-        )
-
-
 @dataclass(frozen=True)
 class LoadedQwen:
     tokenizer: Any
@@ -110,36 +90,6 @@ class FrozenQwen:
     tokenizer: Any
     model: torch.nn.Module
     token_ids: dict[str, int]
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def tokenizer_manifest_hash(path: str | Path) -> str:
-    root = Path(path).resolve()
-    names = {
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "vocab.json",
-        "merges.txt",
-        "added_tokens.json",
-        "special_tokens_map.json",
-        "chat_template.json",
-        "chat_template.jinja",
-    }
-    files = sorted(item for item in root.iterdir() if item.is_file() and item.name in names)
-    if not {"tokenizer.json", "tokenizer_config.json"}.issubset(
-        {item.name for item in files}
-    ):
-        raise ValueError("local Qwen tokenizer files are incomplete")
-    return protocol_hash(
-        [{"name": item.name, "sha256": _sha256(item)} for item in files]
-    )
 
 
 def validate_local_qwen_directory(path: str | Path) -> dict[str, Any]:
@@ -178,27 +128,11 @@ def validate_local_qwen_directory(path: str | Path) -> dict[str, Any]:
         raise ValueError("local Qwen directory must contain exactly four weight shards")
     if mismatches:
         raise ValueError(f"local Qwen architecture mismatch: {mismatches}")
-    hash_payload = {
-        "config_sha256": _sha256(root / "config.json"),
-        "generation_config_sha256": _sha256(root / "generation_config.json"),
-        "index_sha256": _sha256(root / "model.safetensors.index.json"),
-        "tokenizer_manifest_hash": tokenizer_manifest_hash(root),
-        "weight_shards": [
-            {
-                "name": shard.name,
-                "size": shard.stat().st_size,
-                "sha256": _sha256(shard),
-            }
-            for shard in shards
-        ],
-    }
     return {
         "path": str(root),
         "architecture": "Qwen2ForCausalLM",
         **expected,
         "weight_shards": [shard.name for shard in shards],
-        "tokenizer_manifest_hash": hash_payload["tokenizer_manifest_hash"],
-        "model_manifest_hash": protocol_hash(hash_payload),
     }
 
 

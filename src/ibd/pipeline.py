@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import random
 from argparse import Namespace
@@ -16,29 +15,21 @@ from torch.utils.data import DataLoader
 from .anchors import (
     AnchorArtifact,
     AnchorEncoder,
-    anchor_protocol_metadata,
     plan_anchor_payload,
     serialize_anchor_payload,
     state_anchor_payload,
-    validate_anchor_protocol_metadata,
     validate_state_token_budget,
 )
 from .backend import OpenAIBackend, StructuredCaller
 from .checkpointing import CheckpointManager, CheckpointMetadata
-from .config import ANCHOR_PROTOCOL_VERSION, AppConfig
-from .evaluation import (
-    aggregate_causal_metrics,
-    aggregate_intervention_audit,
-    mean_rank_gap,
-    pair_accuracy,
-)
-from .hashing import protocol_hash
+from .config import AppConfig
+from .evaluation import aggregate_causal_metrics, aggregate_intervention_audit
 from .interventions import (
+    ConditionalEffectVerdict,
     EffectVerification,
     InterventionBuilder,
     InterventionExcluded,
-    MarginPairBuilder,
-    PairVerdict,
+    StateEffectVerdict,
     StateField,
     mask_state_field,
     select_counterfactual_plan,
@@ -49,17 +40,16 @@ from .qwen import (
     QwenTrainingConfig,
     load_frozen_qwen_for_anchors,
     load_qwen_qlora,
-    tokenizer_manifest_hash,
     validate_local_qwen_directory,
 )
 from .schemas import (
     History,
     InterventionRecord,
     MASKED_STATE_VALUE,
-    MarginPair,
     PlanSelection,
-    SafetyCritiqueReport,
+    SafetyVerdict,
     STATE_ANCHOR_FIELDS,
+    StateBlackboard,
     TeacherTrace,
 )
 from .storage import read_jsonl, write_jsonl
@@ -73,8 +63,8 @@ from .trainer import StageTrainer, build_paged_adamw_8bit
 from .training import length_normalized_score, response_token_log_probs
 
 
-StageName = Literal["A", "B", "C", "D"]
-_STAGES: tuple[StageName, ...] = ("A", "B", "C", "D")
+StageName = Literal["A", "B", "C"]
+_STAGES: tuple[StageName, ...] = ("A", "B", "C")
 
 
 def _intervention_shape_exclusion(
@@ -95,10 +85,8 @@ def _intervention_shape_exclusion(
             return "state_not_single_field"
         return None
     if function == "PLAN":
-        used = PlanSelection.from_final_answer(trace.final_answer)
-        if len(used.strategies) not in {1, 2}:
-            return "plan_cardinality"
-        if not set(used.strategies).issubset(trace.plan.strategies):
+        used = trace.final_selection.to_plan_selection()
+        if used.strategies[0] not in trace.plan.strategies:
             return "plan_overlap"
     return None
 
@@ -118,7 +106,6 @@ def build_stage_rows(
     traces: Sequence[TeacherTrace],
     *,
     interventions: Sequence[InterventionRecord] = (),
-    margins: Sequence[MarginPair] = (),
     splits: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     allowed_splits = splits or {"train"}
@@ -134,9 +121,7 @@ def build_stage_rows(
                 "example_id": trace.example_id,
                 "history": trace.history.model_dump(mode="json"),
                 "response": trace.final_response,
-                "strategy_uses": trace.final_answer.model_dump(mode="json")[
-                    "strategy_uses"
-                ],
+                "selected_strategy": trace.final_selection.selected_strategy,
             }
             for trace in selected_traces.values()
         ]
@@ -152,7 +137,11 @@ def build_stage_rows(
                 raise ValueError(
                     f"intervention full_response mismatch for {intervention.example_id}"
                 )
-            if not intervention.localized_degradation or not intervention.bidirectional_verified:
+            if (
+                not intervention.localized_effect
+                or not intervention.conditional_correspondence_verified
+                or not intervention.bidirectional_verified
+            ):
                 raise ValueError(
                     f"intervention verification flags are false for {intervention.example_id}"
                 )
@@ -163,33 +152,6 @@ def build_stage_rows(
                     "function": intervention.function,
                     "full_response": intervention.full_response,
                     "counterfactual_response": intervention.counterfactual_response,
-                }
-            )
-        return rows
-    if stage == "D":
-        rows = []
-        for margin in _unique_by_id(margins, label="margin pair").values():
-            trace = selected_traces.get(margin.example_id)
-            if trace is None:
-                continue
-            if margin.chosen != trace.final_response:
-                raise ValueError(f"margin chosen mismatch for {margin.example_id}")
-            if margin.prompt != trace.history.as_prompt():
-                raise ValueError(f"margin prompt mismatch for {margin.example_id}")
-            if not margin.order_swap_verified or not margin.safety_filter_passed:
-                raise ValueError(f"margin verification flags are false for {margin.example_id}")
-            rows.append(
-                {
-                    "example_id": margin.example_id,
-                    "history": trace.history.model_dump(mode="json"),
-                    "chosen": margin.chosen,
-                    "rejected": margin.rejected,
-                    "chosen_strategy_uses": [
-                        item.model_dump(mode="json")
-                        for item in margin.chosen_strategy_uses
-                    ],
-                    "rejected_strategy_id": margin.rejected_strategy_id,
-                    "rejected_strategy": margin.rejected_strategy,
                 }
             )
         return rows
@@ -229,13 +191,21 @@ def build_anchor_artifact(
     batch_size: int = 1,
     diagnostic_state_field: StateField | None = None,
     global_seed: int | None = None,
+    original_splits: set[str] | None = None,
 ) -> AnchorArtifact:
     all_trace_by_id = _unique_by_id(traces, label="Teacher trace")
     intervention_by_id = _unique_by_id(interventions, label="intervention")
+    selected_splits = {"train"} if original_splits is None else original_splits
+    allowed_splits = {"train", "dev", "diagnostic_holdout"}
+    invalid_splits = selected_splits - allowed_splits
+    if invalid_splits:
+        raise ValueError(f"unknown original anchor splits: {sorted(invalid_splits)}")
+    if not selected_splits:
+        raise ValueError("original anchor splits must not be empty")
     trace_by_id = {
         example_id: trace
         for example_id, trace in all_trace_by_id.items()
-        if trace.split == "train"
+        if trace.split in selected_splits
     }
     ordered_ids = list(trace_by_id)
     state_texts = [
@@ -245,7 +215,7 @@ def build_anchor_artifact(
     plan_texts = [
         serialize_anchor_payload(
             plan_anchor_payload(
-                PlanSelection.from_final_answer(trace_by_id[item].final_answer)
+                trace_by_id[item].final_selection.to_plan_selection()
             )
         )
         for item in ordered_ids
@@ -286,8 +256,8 @@ def build_anchor_artifact(
             diagnostic_state_field,
         )
         diagnostic_plan, _ = select_counterfactual_plan(
-            planned=trace.plan,
-            used=PlanSelection.from_final_answer(trace.final_answer),
+            candidates=trace.candidates,
+            selected_candidate_id=trace.final_selection.selected_candidate_id,
             example_id=trace.example_id,
             global_seed=global_seed,
         )
@@ -336,7 +306,7 @@ def build_anchor_artifact(
         if plan_mutations
         else None
     )
-    artifact_metadata = {**dict(metadata), **anchor_protocol_metadata()}
+    artifact_metadata = dict(metadata)
     artifact_metadata["diagnostic_clamp_ids"] = diagnostic_ids
     return AnchorArtifact(
         state=state,
@@ -358,60 +328,6 @@ def _read_models(path: str | Path, model_type: type[Any]) -> list[Any]:
     return [model_type.model_validate(record) for record in read_jsonl(path)]
 
 
-def _file_sha256(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _validate_anchor_metadata(
-    anchors: AnchorArtifact,
-    expected: Mapping[str, Any],
-) -> None:
-    validate_anchor_protocol_metadata(anchors.metadata)
-    for key, value in expected.items():
-        if key not in anchors.metadata:
-            raise ValueError(f"anchor metadata is missing {key}")
-        if anchors.metadata[key] != value:
-            raise ValueError(
-                f"anchor {key} mismatch: artifact={anchors.metadata[key]!r}, "
-                f"expected={value!r}"
-            )
-
-
-def _teacher_protocol_hash(traces: Sequence[TeacherTrace]) -> str:
-    hashes = {trace.teacher_protocol_hash for trace in traces}
-    if len(hashes) != 1:
-        raise ValueError("anchor inputs must use exactly one Teacher protocol")
-    return next(iter(hashes))
-
-
-def _anchor_runtime_metadata(
-    config: QwenTrainingConfig,
-    loaded: Any,
-    *,
-    traces: Sequence[TeacherTrace] | None = None,
-) -> dict[str, Any]:
-    model_manifest = validate_local_qwen_directory(config.model_path)
-    expected = {
-        "model_hash": model_manifest["model_manifest_hash"],
-        "tokenizer_hash": tokenizer_manifest_hash(config.model_path),
-        "special_token_ids": loaded.token_ids,
-        "teacher_schema_hash": protocol_hash(TeacherTrace.model_json_schema()),
-        "protocol_hash": config.anchor_config_hash,
-        "slot_layer": config.slot_layer,
-        **anchor_protocol_metadata(),
-    }
-    if traces is not None:
-        expected["split_hash"] = protocol_hash(
-            {trace.example_id: trace.split for trace in traces}
-        )
-        expected["teacher_protocol_hash"] = _teacher_protocol_hash(traces)
-    return expected
-
-
 def _write_json(path: str | Path, value: Mapping[str, Any]) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -424,54 +340,159 @@ def _write_json(path: str | Path, value: Mapping[str, Any]) -> None:
 def _verify_intervention_effect(
     caller: StructuredCaller,
     trace: TeacherTrace,
-    full_response: str,
-    intervened_response: str,
-    dimension: str,
+    original_plan: PlanSelection,
+    counterfactual_plan: PlanSelection,
+    original_response: str,
+    counterfactual_response: str,
 ) -> EffectVerification:
     first, _ = caller.call(
-        "pair_verifier",
+        "condition_effect_verifier",
         build_messages(
-            "pair_verifier",
+            "condition_effect_verifier",
             trace.history,
-            PairVerdict,
-            context={"A": full_response, "B": intervened_response, "dimension": dimension},
+            ConditionalEffectVerdict,
+            context={
+                "condition_A": original_plan,
+                "response_A": original_response,
+                "condition_B": counterfactual_plan,
+                "response_B": counterfactual_response,
+                "function": "PLAN",
+            },
         ),
-        PairVerdict,
-        example_id=f"{trace.example_id}:effect:{dimension}:ab",
+        ConditionalEffectVerdict,
+        example_id=f"{trace.example_id}:effect:PLAN:ab",
     )
     second, _ = caller.call(
-        "pair_verifier",
+        "condition_effect_verifier",
         build_messages(
-            "pair_verifier",
+            "condition_effect_verifier",
             trace.history,
-            PairVerdict,
-            context={"A": intervened_response, "B": full_response, "dimension": dimension},
+            ConditionalEffectVerdict,
+            context={
+                "condition_A": counterfactual_plan,
+                "response_A": counterfactual_response,
+                "condition_B": original_plan,
+                "response_B": original_response,
+                "function": "PLAN",
+            },
         ),
-        PairVerdict,
-        example_id=f"{trace.example_id}:effect:{dimension}:ba",
+        ConditionalEffectVerdict,
+        example_id=f"{trace.example_id}:effect:PLAN:ba",
     )
-    first_preference = {
-        "A": "full",
-        "B": "counterfactual",
-        "tie": "tie",
-    }[first.preferred]
-    second_preference = {
-        "A": "counterfactual",
-        "B": "full",
-        "tie": "tie",
-    }[second.preferred]
-    if first_preference != second_preference:
+    if (
+        first.condition_a_fit != second.condition_b_fit
+        or first.condition_b_fit != second.condition_a_fit
+        or first.control_effect_present != second.control_effect_present
+    ):
         return EffectVerification(
             passed=False,
             reason="bidirectional_disagreement",
         )
     if (
-        first_preference != "full"
-        or first.defect_dimension != dimension
-        or second.defect_dimension != dimension
+        not first.condition_a_fit
+        or not first.condition_b_fit
+        or not first.control_effect_present
     ):
         return EffectVerification(passed=False, reason="no_localized_effect")
     return EffectVerification(passed=True)
+
+
+_AUXILIARY_DIMENSION_ORDER = (
+    "emotion",
+    "need",
+    "relationship",
+    "intent",
+    "specificity",
+    "timing",
+    "effectiveness",
+    "autonomy",
+    "factuality",
+    "non_template",
+)
+
+
+def _verify_state_intervention_effect(
+    caller: StructuredCaller,
+    trace: TeacherTrace,
+    original_state: StateBlackboard,
+    mutated_state: StateBlackboard,
+    target_field: StateField,
+    full_response: str,
+    counterfactual_response: str,
+) -> EffectVerification:
+    original_payload = original_state.model_dump(mode="json")
+    mutated_payload = mutated_state.model_dump(mode="json")
+    unchanged_state = {
+        field: value
+        for field, value in original_payload.items()
+        if field != target_field
+    }
+    condition_original = {
+        "target_value": original_payload[target_field],
+        "response": full_response,
+    }
+    condition_counterfactual = {
+        "target_value": mutated_payload[target_field],
+        "response": counterfactual_response,
+    }
+    first, _ = caller.call(
+        "state_effect_verifier",
+        build_messages(
+            "state_effect_verifier",
+            trace.history,
+            StateEffectVerdict,
+            context={
+                "target_field": target_field,
+                "unchanged_state": unchanged_state,
+                "condition_A": condition_original,
+                "condition_B": condition_counterfactual,
+            },
+        ),
+        StateEffectVerdict,
+        example_id=f"{trace.example_id}:effect:STATE:{target_field}:ab",
+    )
+    second, _ = caller.call(
+        "state_effect_verifier",
+        build_messages(
+            "state_effect_verifier",
+            trace.history,
+            StateEffectVerdict,
+            context={
+                "target_field": target_field,
+                "unchanged_state": unchanged_state,
+                "condition_A": condition_counterfactual,
+                "condition_B": condition_original,
+            },
+        ),
+        StateEffectVerdict,
+        example_id=f"{trace.example_id}:effect:STATE:{target_field}:ba",
+    )
+    if (
+        first.condition_a_fit != second.condition_b_fit
+        or first.condition_b_fit != second.condition_a_fit
+        or first.field_effect_present != second.field_effect_present
+    ):
+        return EffectVerification(
+            passed=False,
+            reason="bidirectional_disagreement",
+        )
+    if (
+        not first.condition_a_fit
+        or not first.condition_b_fit
+        or not first.field_effect_present
+        or not second.field_effect_present
+    ):
+        return EffectVerification(passed=False, reason="no_localized_effect")
+    dimensions = set(first.affected_dimensions) | set(second.affected_dimensions)
+    affected_dimensions = tuple(
+        dimension
+        for dimension in _AUXILIARY_DIMENSION_ORDER
+        if dimension in dimensions
+    )
+    return EffectVerification(
+        passed=True,
+        affected_dimensions=affected_dimensions,
+    )
 
 
 def _verify_intervention_safety(
@@ -480,41 +501,21 @@ def _verify_intervention_safety(
     full_response: str,
     counterfactual_response: str,
 ) -> bool:
-    candidate_ids = {"full", "counterfactual"}
     report, _ = caller.call(
-        "safety_critic",
+        "safety_verifier",
         build_messages(
-            "safety_critic",
+            "safety_verifier",
             trace.history,
-            SafetyCritiqueReport,
+            SafetyVerdict,
             context={
-                "state": trace.state,
-                "candidates": [
-                    {
-                        "candidate_id": "full",
-                        "strategy_id": "S1",
-                        "strategy": "Others",
-                        "response": full_response,
-                        "seed": 0,
-                    },
-                    {
-                        "candidate_id": "counterfactual",
-                        "strategy_id": "S2",
-                        "strategy": "Others",
-                        "response": counterfactual_response,
-                        "seed": 1,
-                    },
-                ],
+                "original_response": full_response,
+                "counterfactual_response": counterfactual_response,
             },
         ),
-        SafetyCritiqueReport,
+        SafetyVerdict,
         example_id=f"{trace.example_id}:intervention:safety",
     )
-    return (
-        report.critic == "safety"
-        and set(report.candidate_issues) == candidate_ids
-        and not any(report.candidate_issues.values())
-    )
+    return report.original_safe and report.counterfactual_safe
 
 
 def _command_build_interventions(args: Namespace) -> int:
@@ -547,10 +548,10 @@ def _command_build_interventions(args: Namespace) -> int:
             ]
             state_attempt_index += 1
         else:
-            original_plan = PlanSelection.from_final_answer(trace.final_answer)
+            original_plan = trace.final_selection.to_plan_selection()
             counterfactual_plan, _ = select_counterfactual_plan(
-                planned=trace.plan,
-                used=original_plan,
+                candidates=trace.candidates,
+                selected_candidate_id=trace.final_selection.selected_candidate_id,
                 example_id=trace.example_id,
                 global_seed=args.global_seed,
             )
@@ -565,13 +566,12 @@ def _command_build_interventions(args: Namespace) -> int:
             "original_plan_categories": original_plan_categories,
             "counterfactual_plan_categories": counterfactual_plan_categories,
             "global_seed": args.global_seed,
-            "protocol_version": ANCHOR_PROTOCOL_VERSION,
-            "original_anchor_hash": None,
-            "counterfactual_anchor_hash": None,
             "effect_verification": {
                 "passed": False,
-                "localized_degradation": False,
+                "localized_effect": False,
+                "conditional_correspondence_verified": False,
                 "bidirectional_verified": False,
+                "affected_dimensions": [],
             },
             "exclusion_reason": None,
         }
@@ -588,18 +588,36 @@ def _command_build_interventions(args: Namespace) -> int:
             continue
         builder = InterventionBuilder(
             runner,
-            lambda full, changed, dimension, current=trace: _verify_intervention_effect(
-                caller,
-                current,
-                full,
-                changed,
-                dimension,
+            verify_safety=(
+                lambda full, changed, current=trace: _verify_intervention_safety(
+                    caller,
+                    current,
+                    full,
+                    changed,
+                )
             ),
-            lambda full, changed, current=trace: _verify_intervention_safety(
-                caller,
-                current,
-                full,
-                changed,
+            verify_state_effect=(
+                lambda original, mutated, field, full, changed, current=trace:
+                _verify_state_intervention_effect(
+                    caller,
+                    current,
+                    original,
+                    mutated,
+                    field,
+                    full,
+                    changed,
+                )
+            ),
+            verify_plan_effect=(
+                lambda original_plan, counterfactual_plan, original, changed,
+                current=trace: _verify_intervention_effect(
+                    caller,
+                    current,
+                    original_plan,
+                    counterfactual_plan,
+                    original,
+                    changed,
+                )
             ),
         )
         try:
@@ -615,49 +633,22 @@ def _command_build_interventions(args: Namespace) -> int:
             intervention_audit.append(audit_entry)
         else:
             retained.append(record)
-            if function == "STATE":
-                original_payload = state_anchor_payload(trace.state)
-                counterfactual_payload = state_anchor_payload(record.mutated_state)
-            else:
-                original_payload = plan_anchor_payload(
-                    PlanSelection.from_final_answer(trace.final_answer)
-                )
-                counterfactual_payload = plan_anchor_payload(record.mutated_plan)
             audit_entry.update(
                 {
                     "status": "retained",
-                    "original_anchor_hash": hashlib.sha256(
-                        serialize_anchor_payload(original_payload).encode("utf-8")
-                    ).hexdigest(),
-                    "counterfactual_anchor_hash": hashlib.sha256(
-                        serialize_anchor_payload(counterfactual_payload).encode("utf-8")
-                    ).hexdigest(),
                     "effect_verification": {
                         "passed": True,
-                        "localized_degradation": record.localized_degradation,
+                        "localized_effect": record.localized_effect,
+                        "conditional_correspondence_verified": (
+                            record.conditional_correspondence_verified
+                        ),
                         "bidirectional_verified": record.bidirectional_verified,
+                        "affected_dimensions": list(record.affected_dimensions),
                     },
                 }
             )
             intervention_audit.append(audit_entry)
-    margin_builder = MarginPairBuilder(backend, config)
-    margins: list[MarginPair] = []
-    margin_excluded: dict[str, str] = {}
-    for trace in track(
-        ordered,
-        desc="build margin pairs",
-        total=len(ordered),
-        unit="example",
-    ):
-        pair = margin_builder.build(trace)
-        if pair is None:
-            margin_excluded[trace.example_id] = (
-                "no safe localized near-negative or order-stable preference"
-            )
-        else:
-            margins.append(pair)
     write_jsonl(args.output, retained)
-    write_jsonl(args.margins_output, margins)
 
     def counts_by_split(items: Sequence[Any]) -> dict[str, int]:
         trace_splits = {trace.example_id: trace.split for trace in traces}
@@ -681,16 +672,9 @@ def _command_build_interventions(args: Namespace) -> int:
                 "excluded": intervention_excluded,
                 "audit": intervention_audit,
             },
-            "stage_d": {
-                "attempted": len(ordered),
-                "retained": len(margins),
-                "retained_by_split": counts_by_split(margins),
-                "excluded": margin_excluded,
-            },
-            "input_sha256": _file_sha256(args.input),
         },
     )
-    print(f"wrote {len(retained)} interventions and {len(margins)} margin pairs")
+    print(f"wrote {len(retained)} interventions")
     return 0
 
 
@@ -708,25 +692,15 @@ def _command_precompute_anchors(args: Namespace) -> int:
         loaded.tokenizer,
         slot_layer=config.slot_layer,
     )
-    split_hash = protocol_hash(
-        {trace.example_id: trace.split for trace in traces}
-    )
-    metadata = {
-        **_anchor_runtime_metadata(config, loaded, traces=traces),
-        "split_hash": split_hash,
-        "trace_source_hash": _file_sha256(args.traces),
-        "intervention_source_hash": (
-            _file_sha256(args.interventions) if args.interventions else None
-        ),
-    }
     artifact = build_anchor_artifact(
         traces,
         interventions,
         encoder,
-        metadata=metadata,
+        metadata={},
         batch_size=args.batch_size,
         diagnostic_state_field=args.diagnostic_state_field,
         global_seed=args.global_seed,
+        original_splits=set(args.original_splits),
     )
     artifact.save(args.output)
     print(f"wrote {len(artifact.example_to_row)} anchor rows")
@@ -735,16 +709,6 @@ def _command_precompute_anchors(args: Namespace) -> int:
 
 def _checkpoint_payload(path: str | Path) -> dict[str, Any]:
     return json.loads((Path(path) / "checkpoint.json").read_text(encoding="utf-8"))
-
-
-def _data_manifest_hash(args: Namespace) -> str:
-    return protocol_hash(
-        {
-            "traces": _file_sha256(args.traces),
-            "interventions": _file_sha256(args.interventions),
-            "margins": _file_sha256(args.margins),
-        }
-    )
 
 
 def _stage_collator(stage: StageName, loaded: Any, config: QwenTrainingConfig):
@@ -761,12 +725,7 @@ def _stage_collator(stage: StageName, loaded: Any, config: QwenTrainingConfig):
             right_key="counterfactual_response",
             **common,
         )
-    return QwenPairCollator(
-        loaded.tokenizer,
-        left_key="chosen",
-        right_key="rejected",
-        **common,
-    )
+    raise ValueError(f"unknown training stage {stage}")
 
 
 def _requested_stages(args: Namespace) -> list[StageName]:
@@ -778,7 +737,7 @@ def _requested_stages(args: Namespace) -> list[StageName]:
     source_index = _STAGES.index(source_stage)
     remaining = list(_STAGES[source_index + 1 :])
     if not remaining:
-        raise ValueError("pipeline resume checkpoint already completed Stage D")
+        raise ValueError("pipeline resume checkpoint already completed Stage C")
     return remaining
 
 
@@ -813,16 +772,7 @@ def _command_train(args: Namespace) -> int:
     loaded = load_qwen_qlora(config, device=args.device)
     anchors = AnchorArtifact.load(args.anchors)
     traces = _read_models(args.traces, TeacherTrace)
-    _validate_anchor_metadata(
-        anchors,
-        {
-            **_anchor_runtime_metadata(config, loaded, traces=traces),
-            "trace_source_hash": _file_sha256(args.traces),
-            "intervention_source_hash": _file_sha256(args.interventions),
-        },
-    )
     interventions = _read_models(args.interventions, InterventionRecord)
-    margins = _read_models(args.margins, MarginPair)
     optimizer = build_paged_adamw_8bit(
         loaded.model,
         learning_rate=config.learning_rate,
@@ -850,14 +800,10 @@ def _command_train(args: Namespace) -> int:
         run_path,
         run_name=args.run_name,
         seed=args.seed,
-        config_hash=config.config_hash,
     )
     stages = _requested_stages(args)
-    parent_hash: str | None = None
     restored_metadata: CheckpointMetadata | None = None
     if args.resume:
-        resume_payload = _checkpoint_payload(args.resume)
-        parent_hash = resume_payload["checkpoint_hash"]
         restored_metadata = manager.load(
             args.resume,
             target_stage=stages[0],
@@ -866,14 +812,6 @@ def _command_train(args: Namespace) -> int:
             scheduler=scheduler,
             scaler=scaler,
             expected={
-                "protocol_hash": anchors.metadata["protocol_hash"],
-                "seed": args.seed,
-                "config_hash": config.config_hash,
-                "model_hash": anchors.metadata["model_hash"],
-                "tokenizer_hash": anchors.metadata["tokenizer_hash"],
-                "data_manifest_hash": _data_manifest_hash(args),
-                "split_hash": anchors.metadata["split_hash"],
-                "anchor_hash": _file_sha256(args.anchors),
                 "slot_layer": config.slot_layer,
                 "special_token_ids": loaded.token_ids,
             },
@@ -886,15 +824,12 @@ def _command_train(args: Namespace) -> int:
         raise ValueError(f"Stage {stages[0]} requires --resume from its legal predecessor")
 
     summaries: list[dict[str, Any]] = []
-    data_hash = _data_manifest_hash(args)
-    anchor_hash = _file_sha256(args.anchors)
     for stage in stages:
         epoch = _stage_epoch(stage, restored_metadata)
         rows = build_stage_rows(
             stage,
             traces,
             interventions=interventions,
-            margins=margins,
         )
         generator = torch.Generator().manual_seed(
             args.seed + ord(stage) + epoch * 1_000_003
@@ -925,16 +860,8 @@ def _command_train(args: Namespace) -> int:
             seed=args.seed,
             epoch=epoch,
             global_step=trainer.optimizer_steps,
-            protocol_hash=anchors.metadata["protocol_hash"],
-            config_hash=config.config_hash,
-            model_hash=anchors.metadata["model_hash"],
-            tokenizer_hash=anchors.metadata["tokenizer_hash"],
-            data_manifest_hash=data_hash,
-            split_hash=anchors.metadata["split_hash"],
-            anchor_hash=anchor_hash,
             slot_layer=config.slot_layer,
             special_token_ids=loaded.token_ids,
-            parent_checkpoint_hash=parent_hash,
         )
         checkpoint = manager.save(
             metadata,
@@ -942,10 +869,7 @@ def _command_train(args: Namespace) -> int:
             optimizer=optimizer,
             scheduler=scheduler,
             scaler=scaler,
-            tokenizer=loaded.tokenizer,
         )
-        payload = _checkpoint_payload(checkpoint)
-        parent_hash = payload["checkpoint_hash"]
         summaries.append(
             {
                 "stage": stage,
@@ -958,7 +882,6 @@ def _command_train(args: Namespace) -> int:
                 "lora_parameters": loaded.lora_parameters,
                 "token_row_parameters": loaded.token_row_parameters,
                 "checkpoint": str(checkpoint),
-                "checkpoint_hash": parent_hash,
             }
         )
     print(json.dumps(summaries, ensure_ascii=False))
@@ -1063,30 +986,23 @@ def _causal_anchor_clamp(
 
 def _restore_for_inference(
     args: Namespace,
-    *,
-    expected: Mapping[str, Any] | None = None,
 ):
     config = QwenTrainingConfig.from_yaml(args.config)
     loaded = load_qwen_qlora(config, device=args.device)
-    model_manifest = validate_local_qwen_directory(config.model_path)
+    validate_local_qwen_directory(config.model_path)
     payload = _checkpoint_payload(args.checkpoint)
     manager = CheckpointManager(
         Path(args.checkpoint).parent,
         run_name=args.run_name,
         seed=int(payload["metadata"]["seed"]),
-        config_hash=config.config_hash,
     )
     manager.load(
         args.checkpoint,
         target_stage=payload["metadata"]["stage"],
         model=loaded.model,
         expected={
-            "config_hash": config.config_hash,
-            "model_hash": model_manifest["model_manifest_hash"],
-            "tokenizer_hash": tokenizer_manifest_hash(config.model_path),
             "slot_layer": config.slot_layer,
             "special_token_ids": loaded.token_ids,
-            **dict(expected or {}),
         },
         restore_rng=False,
     )
@@ -1097,46 +1013,8 @@ def _restore_for_inference(
 def _command_evaluate(args: Namespace) -> int:
     traces = _read_models(args.traces, TeacherTrace)
     interventions = _read_models(args.interventions, InterventionRecord)
-    margins = _read_models(args.margins, MarginPair)
     anchors = AnchorArtifact.load(args.anchors)
-    config, loaded = _restore_for_inference(
-        args,
-        expected={
-            "protocol_hash": anchors.metadata["protocol_hash"],
-            "data_manifest_hash": _data_manifest_hash(args),
-            "split_hash": anchors.metadata["split_hash"],
-            "anchor_hash": _file_sha256(args.anchors),
-        },
-    )
-    _validate_anchor_metadata(
-        anchors,
-        {
-            **_anchor_runtime_metadata(config, loaded, traces=traces),
-            "trace_source_hash": _file_sha256(args.traces),
-            "intervention_source_hash": _file_sha256(args.interventions),
-        },
-    )
-    rows = build_stage_rows("D", traces, margins=margins, splits={"dev"})
-    if not rows:
-        raise ValueError("evaluation has no dev margin pairs")
-    collator = QwenPairCollator(
-        loaded.tokenizer,
-        max_length=config.max_length,
-        token_ids=loaded.token_ids,
-        left_key="chosen",
-        right_key="rejected",
-    )
-    chosen_scores: list[float] = []
-    rejected_scores: list[float] = []
-    for row in track(
-        rows,
-        desc="evaluate margins",
-        total=len(rows),
-        unit="example",
-    ):
-        batch = collator([row])
-        chosen_scores.append(float(_score_encoded(loaded, batch["chosen"])[0]))
-        rejected_scores.append(float(_score_encoded(loaded, batch["rejected"])[0]))
+    config, loaded = _restore_for_inference(args)
     functional_rows = build_stage_rows(
         "C",
         traces,
@@ -1177,26 +1055,26 @@ def _command_evaluate(args: Namespace) -> int:
         )
         original_original, original_original_slots = _score_encoded(
             loaded,
-            batch["chosen"],
+            batch["original"],
             clamps=original_clamp,
             capture_slots=True,
         )
         original_counterfactual, original_counterfactual_slots = _score_encoded(
             loaded,
-            batch["rejected"],
+            batch["counterfactual"],
             clamps=original_clamp,
             capture_slots=True,
         )
         counterfactual_original, counterfactual_original_slots = _score_encoded(
             loaded,
-            batch["chosen"],
+            batch["original"],
             clamps=counterfactual_clamp,
             capture_slots=True,
         )
         counterfactual_counterfactual, counterfactual_counterfactual_slots = (
             _score_encoded(
                 loaded,
-                batch["rejected"],
+                batch["counterfactual"],
                 clamps=counterfactual_clamp,
                 capture_slots=True,
             )
@@ -1248,11 +1126,7 @@ def _command_evaluate(args: Namespace) -> int:
     }
     report = {
         "split": "dev",
-        "pairs": len(rows),
-        "pair_accuracy": pair_accuracy(chosen_scores, rejected_scores),
-        "mean_rank_gap": mean_rank_gap(chosen_scores, rejected_scores),
-        "chosen_scores": chosen_scores,
-        "rejected_scores": rejected_scores,
+        "pairs": len(functional_rows),
         "causal": aggregate_causal_metrics(causal_observations),
         "causal_observations": causal_observations,
         "intervention_audit": aggregate_intervention_audit(
@@ -1271,18 +1145,7 @@ def _command_generate(args: Namespace) -> int:
     if any(clamp_args) and not all(clamp_args):
         raise ValueError("--clamp, --anchors, and --example-id must be provided together")
     anchors = AnchorArtifact.load(args.anchors) if args.clamp else None
-    config, loaded = _restore_for_inference(
-        args,
-        expected=(
-            {
-                "protocol_hash": anchors.metadata["protocol_hash"],
-                "split_hash": anchors.metadata["split_hash"],
-                "anchor_hash": _file_sha256(args.anchors),
-            }
-            if anchors is not None
-            else None
-        ),
-    )
+    config, loaded = _restore_for_inference(args)
     payload = json.loads(Path(args.history).read_text(encoding="utf-8"))
     history = History.model_validate(payload.get("history", payload))
     prompt = encode_generation_prompt(
@@ -1303,10 +1166,6 @@ def _command_generate(args: Namespace) -> int:
     clamps = None
     if args.clamp:
         assert anchors is not None
-        _validate_anchor_metadata(
-            anchors,
-            _anchor_runtime_metadata(config, loaded),
-        )
         clamps = _anchor_clamps(
             anchors,
             args.clamp,

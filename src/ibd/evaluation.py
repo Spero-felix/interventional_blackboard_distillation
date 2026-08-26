@@ -1,4 +1,4 @@
-"""Overall retention, functional fidelity, and Stage D ranking diagnostics."""
+"""Overall retention, functional fidelity, and Stage C controllability diagnostics."""
 
 from __future__ import annotations
 
@@ -68,7 +68,7 @@ def aggregate_intervention_audit(
     *,
     planner_strategies: Mapping[str, Sequence[str]],
 ) -> dict[str, dict[str, object]]:
-    """Summarize Stage C attempts, including PLAN catalog-fallback usage."""
+    """Summarize Stage C attempts and single-field/candidate coverage."""
 
     result: dict[str, dict[str, object]] = {}
     for function in ("STATE", "PLAN"):
@@ -102,16 +102,16 @@ def aggregate_intervention_audit(
                 field: coverage[field] for field in STATE_ANCHOR_FIELDS
             }
         else:
-            fallback_count = 0
+            existing_candidate_count = 0
             for row in rows:
-                example_id = str(row["example_id"])
-                planned = set(planner_strategies.get(example_id, ()))
+                planned = set(planner_strategies.get(str(row["example_id"]), ()))
                 counterfactual = row.get("counterfactual_plan_categories") or ()
-                if any(str(category) not in planned for category in counterfactual):
-                    fallback_count += 1
-            common["fallback_count"] = fallback_count
-            common["fallback_frequency"] = (
-                fallback_count / len(rows) if rows else None
+                if counterfactual and all(
+                    str(category) in planned for category in counterfactual
+                ):
+                    existing_candidate_count += 1
+            common["existing_candidate_reuse_rate"] = (
+                existing_candidate_count / len(rows) if rows else None
             )
         result[function] = common
     invalid = {row.get("function") for row in audit_rows} - {"STATE", "PLAN"}
@@ -226,24 +226,3 @@ def matrix_alignment(teacher: Matrix, student: Matrix) -> dict[str, float]:
         "spearman": spearman,
         "normalized_l1": normalized_l1,
     }
-
-
-def _validate_pair_scores(chosen: Sequence[float], rejected: Sequence[float]) -> None:
-    if not chosen or len(chosen) != len(rejected):
-        raise ValueError("chosen and rejected scores must be non-empty and equally sized")
-
-
-def pair_accuracy(chosen: Sequence[float], rejected: Sequence[float]) -> float:
-    _validate_pair_scores(chosen, rejected)
-    return sum(
-        chosen_score > rejected_score
-        for chosen_score, rejected_score in zip(chosen, rejected, strict=True)
-    ) / len(chosen)
-
-
-def mean_rank_gap(chosen: Sequence[float], rejected: Sequence[float]) -> float:
-    _validate_pair_scores(chosen, rejected)
-    return sum(
-        chosen_score - rejected_score
-        for chosen_score, rejected_score in zip(chosen, rejected, strict=True)
-    ) / len(chosen)

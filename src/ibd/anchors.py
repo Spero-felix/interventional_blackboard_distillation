@@ -13,12 +13,7 @@ from safetensors.torch import save_file
 from torch.nn import functional as F
 from transformers import PreTrainedTokenizerBase
 
-from .config import (
-    ANCHOR_PROTOCOL_VERSION,
-    ANCHOR_SERIALIZER_VERSION,
-    STATE_TOKEN_LIMIT,
-)
-from .hashing import protocol_hash
+from .config import STATE_TOKEN_LIMIT
 from .model import QwenSlotCausalLM
 from .schemas import PlanSelection, STATE_ANCHOR_FIELDS, StateBlackboard
 
@@ -27,20 +22,16 @@ _METADATA_KEY = "ibd_anchor_metadata"
 _EXAMPLE_ROWS_KEY = "ibd_example_to_row"
 _MUTATED_STATE_ROWS_KEY = "ibd_mutated_state_to_row"
 _MUTATED_PLAN_ROWS_KEY = "ibd_mutated_plan_to_row"
-_PROTOCOL_METADATA_KEYS = (
-    "anchor_protocol_version",
-    "anchor_serializer_version",
-    "anchor_serializer_hash",
-    "compact_schema_hash",
-)
-
-
 def state_anchor_payload(state: StateBlackboard) -> dict[str, str]:
     return {field: getattr(state, field) for field in STATE_ANCHOR_FIELDS}
 
 
-def plan_anchor_payload(selection: PlanSelection) -> dict[str, list[str]]:
-    return {"strategies": list(selection.strategies)}
+def plan_anchor_payload(selection: PlanSelection) -> dict[str, str]:
+    return {
+        "strategy": selection.strategies[0],
+        "response_goal": selection.response_goal,
+        "response_act": selection.response_act,
+    }
 
 
 def serialize_anchor_payload(payload: Mapping[str, object]) -> str:
@@ -56,37 +47,6 @@ def validate_state_token_budget(
         raise ValueError(
             f"compact STATE uses {token_count} tokens; limit is {STATE_TOKEN_LIMIT}"
         )
-
-
-def anchor_protocol_metadata() -> dict[str, str]:
-    serializer_contract = {
-        "version": ANCHOR_SERIALIZER_VERSION,
-        "ensure_ascii": False,
-        "separators": [",", ":"],
-        "field_order": "insertion",
-    }
-    compact_schema = {
-        "STATE": StateBlackboard.model_json_schema(),
-        "PLAN": PlanSelection.model_json_schema(),
-    }
-    return {
-        "anchor_protocol_version": ANCHOR_PROTOCOL_VERSION,
-        "anchor_serializer_version": ANCHOR_SERIALIZER_VERSION,
-        "anchor_serializer_hash": protocol_hash(serializer_contract),
-        "compact_schema_hash": protocol_hash(compact_schema),
-    }
-
-
-def validate_anchor_protocol_metadata(metadata: Mapping[str, Any]) -> None:
-    expected = anchor_protocol_metadata()
-    for key in _PROTOCOL_METADATA_KEYS:
-        if key not in metadata:
-            raise ValueError(f"anchor metadata is missing {key}")
-        if metadata[key] != expected[key]:
-            raise ValueError(
-                f"anchor {key} mismatch: artifact={metadata[key]!r}, "
-                f"expected={expected[key]!r}"
-            )
 
 
 @dataclass
@@ -171,7 +131,6 @@ class AnchorArtifact:
         return torch.tensor(rows, dtype=torch.long)
 
     def save(self, path: str | Path) -> None:
-        validate_anchor_protocol_metadata(self.metadata)
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         metadata = {
@@ -193,7 +152,6 @@ class AnchorArtifact:
         if not required.issubset(metadata):
             raise ValueError("anchor artifact metadata is incomplete")
         artifact_metadata = json.loads(metadata[_METADATA_KEY])
-        validate_anchor_protocol_metadata(artifact_metadata)
         return cls(
             state=tensors["state"],
             plan=tensors["plan"],

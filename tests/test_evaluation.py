@@ -55,16 +55,6 @@ def test_matrix_alignment_reports_sign_spearman_and_normalized_l1():
     }
 
 
-def test_pair_accuracy_treats_ties_as_incorrect_and_rank_gap_is_signed():
-    from ibd.evaluation import mean_rank_gap, pair_accuracy
-
-    chosen = [0.2, 0.1]
-    rejected = [0.2, 0.0]
-
-    assert pair_accuracy(chosen, rejected) == 0.5
-    assert mean_rank_gap(chosen, rejected) == pytest.approx(0.05)
-
-
 def test_causal_metrics_separate_functions_count_ties_as_errors_and_keep_empty_groups():
     from ibd.evaluation import aggregate_causal_metrics
 
@@ -107,7 +97,7 @@ def test_causal_metrics_separate_functions_count_ties_as_errors_and_keep_empty_g
     }
 
 
-def test_intervention_audit_reports_fixed_state_coverage_and_plan_fallback_from_planner():
+def test_intervention_audit_reports_state_coverage_and_plan_candidate_reuse():
     from ibd.evaluation import aggregate_intervention_audit
 
     result = aggregate_intervention_audit(
@@ -179,6 +169,5 @@ def test_intervention_audit_reports_fixed_state_coverage_and_plan_fallback_from_
         "eligibility": {"eligible": 2, "ineligible": 0},
         "status": {"retained": 1, "excluded": 1},
         "exclusion_reasons": {"safety_failure": 1},
-        "fallback_count": 1,
-        "fallback_frequency": 0.5,
+        "existing_candidate_reuse_rate": 0.5,
     }

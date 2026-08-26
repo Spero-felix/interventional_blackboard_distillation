@@ -54,6 +54,40 @@ class ScriptedBackend:
         }
         if role in expert_payloads:
             return expert_payloads[role]
+        if role == "multi_view_state_analyzer":
+            return {
+                "views": {
+                    "emotion": {
+                        "summary": "失落",
+                        "evidence": "最近总觉得被忽略",
+                        "uncertainty": "",
+                    },
+                    "need": {
+                        "summary": "希望被理解",
+                        "evidence": "想知道怎么开口",
+                        "uncertainty": "",
+                    },
+                    "relationship": {
+                        "summary": "双方回避沟通",
+                        "evidence": "一谈就躲开",
+                        "uncertainty": "",
+                    },
+                    "intent": {
+                        "summary": "准备一次沟通",
+                        "evidence": "想知道怎么开口",
+                        "uncertainty": "",
+                    },
+                },
+                "state": {
+                    "emotion": "失落",
+                    "intensity": "中等",
+                    "primary_need": "被理解",
+                    "support_goal": "准备一次坦诚沟通",
+                    "readiness": "愿意探索",
+                    "main_constraint": "担心对方继续回避",
+                    "relationship_context": "亲密关系中的沟通僵局",
+                },
+            }
         if role == "state_integrator":
             return {
                 "emotion": "失落",
@@ -88,29 +122,14 @@ class ScriptedBackend:
                 "strategy": strategy,
                 "response": f"候选回复-{role[-1]}",
                 "seed": seed,
+                "response_goal": f"候选目标-{role[-1]}",
+                "response_act": f"候选动作-{role[-1]}",
             }
-        if role.endswith("_critic"):
-            critic = role.removesuffix("_critic")
+        if role == "final_selector":
             return {
-                "critic": critic,
-                "candidate_issues": {"1": [], "2": [], "3": []},
-                "summary": "完成独立检查",
-            }
-        if role == "final_integrator":
-            return {
-                "response": "我能听出那种被忽略后的失落。你更希望先理清期待，还是一起准备一句开场？",
-                "strategy_uses": [
-                    {
-                        "strategy_id": "S1",
-                        "strategy": "Reflection of feelings",
-                        "contribution": "承接用户的失落感",
-                    },
-                    {
-                        "strategy_id": "S2",
-                        "strategy": "Question",
-                        "contribution": "邀请用户选择下一步",
-                    },
-                ],
+                "selected_candidate_id": "2",
+                "response_goal": "帮助用户明确下一步",
+                "response_act": "提出一个开放式问题",
             }
         raise AssertionError(f"unexpected role: {role}")
 

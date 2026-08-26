@@ -9,9 +9,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 
-ANCHOR_PROTOCOL_VERSION = "compact-v2"
 STATE_TOKEN_LIMIT = 128
-ANCHOR_SERIALIZER_VERSION = "canonical-json-v1"
 STRATEGY_CATALOG = (
     "Question",
     "Restatement or Paraphrasing",

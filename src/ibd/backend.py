@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -12,10 +13,14 @@ from typing import Any, Protocol, TypeVar
 from pydantic import BaseModel, ValidationError
 
 from .config import AppConfig, ModelConfig
-from .hashing import protocol_hash
 from .schemas import CallRecord
 
 T = TypeVar("T", bound=BaseModel)
+
+
+def _cache_digest(value: Any) -> str:
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -110,14 +115,10 @@ class StructuredCaller:
         self._memory_cache: dict[str, dict[str, Any]] = {}
         protocol = config.model_dump(mode="json", exclude={"backend": {"cache_dir"}})
         protocol["backend"]["resolved_base_url"] = config.backend.resolve_base_url()
-        self._protocol_hash = protocol_hash(protocol)
-
-    @property
-    def protocol_hash(self) -> str:
-        return self._protocol_hash
+        self._cache_namespace = _cache_digest(protocol)
 
     def _cache_key(self, example_id: str, role: str) -> str:
-        return protocol_hash((example_id, role, self._protocol_hash))
+        return _cache_digest((example_id, role, self._cache_namespace))
 
     def _cache_path(self, key: str, *, failure: bool = False) -> Path | None:
         if self.config.backend.cache_dir is None:
@@ -188,14 +189,8 @@ class StructuredCaller:
         records: list[CallRecord] = []
         current_messages = list(messages)
         last_error: Exception | None = None
-        disable_provider_json_mode = False
         for index in range(self.config.schema_retries + 1):
             model_config = self.config.for_role(role)
-
-            if disable_provider_json_mode:
-                model_config = model_config.model_copy(
-                    update={"provider_json_mode": False}
-                )
 
             if index > 0 and isinstance(last_error, json.JSONDecodeError):
                 model_config = model_config.model_copy(
@@ -215,50 +210,16 @@ class StructuredCaller:
                 if index >= self.config.schema_retries:
                     raise
 
-                # Provider-specific recovery:
-                # json_object mode can occasionally produce whitespace-only output.
-                # For final_integrator, fall back to normal text generation but keep
-                # strict JSON requirements in the prompt and Pydantic validation.
-                if role == "final_integrator" and model_config.provider_json_mode:
-                    disable_provider_json_mode = True
-
-                    current_messages = [
-                        *messages,
-                        {
-                            "role": "user",
-                            "content": (
-                                "The previous provider-enforced JSON response contained only "
-                                "whitespace. Retry WITHOUT answering the seeker directly outside "
-                                "the JSON object.\n\n"
-                                "Your FIRST non-whitespace character MUST be `{` and your LAST "
-                                "non-whitespace character MUST be `}`.\n\n"
-                                "Return exactly one JSON object in this form:\n"
-                                "{\n"
-                                '  "response": "<final supporter response>",\n'
-                                '  "strategy_uses": [\n'
-                                "    {\n"
-                                '      "strategy_id": "<supplied S1/S2/S3>",\n'
-                                '      "strategy": "<exact supplied strategy name>",\n'
-                                '      "contribution": "<brief concrete contribution>"\n'
-                                "    }\n"
-                                "  ]\n"
-                                "}\n\n"
-                                "Use one or two strategy_uses as permitted by the supplied schema. "
-                                "Do not use Markdown. Do not use code fences. Do not add explanation."
-                            ),
-                        },
-                    ]
-                else:
-                    current_messages = [
-                        *messages,
-                        {
-                            "role": "user",
-                            "content": (
-                                "The previous response was empty. "
-                                "Return a non-empty JSON object matching the requested schema."
-                            ),
-                        },
-                    ]
+                current_messages = [
+                    *messages,
+                    {
+                        "role": "user",
+                        "content": (
+                            "The previous response was empty. Return a non-empty JSON "
+                            "object matching the requested schema."
+                        ),
+                    },
+                ]
 
                 continue
             try:
@@ -270,7 +231,6 @@ class StructuredCaller:
                     CallRecord(
                         role=role,
                         attempt=index + 1,
-                        request_hash=protocol_hash(current_messages),
                         raw_text=result.text,
                         parsed={},
                         schema_retry=index > 0,
@@ -278,48 +238,21 @@ class StructuredCaller:
                 )
                 if index >= self.config.schema_retries:
                     break
-                if role == "final_integrator" and model_config.provider_json_mode:
-                    disable_provider_json_mode = True
-                    current_messages = [
-                        *messages,
-                        {
-                            "role": "user",
-                            "content": (
-                                "The previous provider-enforced JSON response was not valid "
-                                f"JSON: {exc}. Retry WITHOUT answering the seeker directly "
-                                "outside the JSON object.\n\n"
-                                "Your FIRST non-whitespace character MUST be `{` and your LAST "
-                                "non-whitespace character MUST be `}`.\n\n"
-                                "Return exactly one JSON object in this form:\n"
-                                "{\n"
-                                '  "response": "<final supporter response>",\n'
-                                '  "strategy_uses": [\n'
-                                "    {\n"
-                                '      "strategy_id": "<supplied S1/S2/S3>",\n'
-                                '      "strategy": "<exact supplied strategy name>",\n'
-                                '      "contribution": "<brief concrete contribution>"\n'
-                                "    }\n"
-                                "  ]\n"
-                                "}\n\n"
-                                "Use one or two strategy_uses as permitted by the supplied schema. "
-                                "Do not use Markdown. Do not use code fences. Do not add explanation."
-                            ),
-                        },
-                    ]
-                else:
-                    current_messages = [
-                        *messages,
-                        {
-                            "role": "user",
-                            "content": f"Previous output violated the JSON schema: {exc}. Return corrected JSON only.",
-                        },
-                    ]
+                current_messages = [
+                    *messages,
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Previous output violated the JSON schema: {exc}. "
+                            "Return corrected JSON only."
+                        ),
+                    },
+                ]
                 continue
             records.append(
                 CallRecord(
                     role=role,
                     attempt=index + 1,
-                    request_hash=protocol_hash(current_messages),
                     raw_text=result.text,
                     parsed=parsed.model_dump(mode="json"),
                     schema_retry=index > 0,
@@ -330,7 +263,6 @@ class StructuredCaller:
                 cache_payload = {
                     "example_id": example_id,
                     "role": role,
-                    "protocol_hash": self._protocol_hash,
                     "parsed": parsed.model_dump(mode="json"),
                     "record": record.model_dump(mode="json"),
                 }
@@ -347,7 +279,6 @@ class StructuredCaller:
                     {
                         "example_id": example_id,
                         "role": role,
-                        "protocol_hash": self._protocol_hash,
                         "records": [record.model_dump(mode="json") for record in records],
                         "error": str(last_error),
                     },

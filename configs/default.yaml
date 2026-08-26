@@ -1,4 +1,4 @@
-protocol_version: compact-v2
+protocol_version: single-strategy-controllability-v3
 
 backend:
   base_url_env: OPENAI_BASE_URL

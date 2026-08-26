@@ -1,17 +1,15 @@
-"""Explicit Student-data allowlists that prevent Teacher audit leakage."""
+"""Student-data allowlists that prevent Teacher audit leakage."""
 
 from __future__ import annotations
 
 from typing import Any
 
-from .schemas import InterventionRecord, MarginPair, TeacherTrace
+from .schemas import InterventionRecord, TeacherTrace
 
 
 def _ensure_trainable(trace: TeacherTrace) -> None:
-    if trace.split == "test":
-        raise ValueError("test split traces cannot be exported for Student training")
-    if trace.split == "diagnostic_holdout":
-        raise ValueError("diagnostic holdout traces cannot be exported for Student training")
+    if trace.split in {"test", "diagnostic_holdout"}:
+        raise ValueError(f"{trace.split} traces cannot be exported for Student training")
 
 
 def sft_row(trace: TeacherTrace) -> dict[str, Any]:
@@ -20,7 +18,7 @@ def sft_row(trace: TeacherTrace) -> dict[str, Any]:
         "example_id": trace.example_id,
         "prompt": trace.history.as_prompt(),
         "response": trace.final_response,
-        "strategy_uses": trace.final_answer.model_dump(mode="json")["strategy_uses"],
+        "selected_strategy": trace.final_selection.selected_strategy,
     }
 
 
@@ -30,10 +28,7 @@ def slot_row(trace: TeacherTrace) -> dict[str, Any]:
         "example_id": trace.example_id,
         "prompt": trace.history.as_prompt(),
         "state": trace.state.model_dump(mode="json"),
-        "plan": {
-            **trace.plan.model_dump(mode="json"),
-            "strategy_uses": trace.final_answer.model_dump(mode="json")["strategy_uses"],
-        },
+        "plan": trace.final_selection.to_plan_selection().model_dump(mode="json"),
     }
 
 
@@ -49,18 +44,8 @@ def intervention_row(record: InterventionRecord, prompt: str) -> dict[str, Any]:
         "full_response": record.full_response,
         "counterfactual_response": record.counterfactual_response,
         "target_dimension": record.target_dimension,
-    }
-
-
-def margin_row(pair: MarginPair) -> dict[str, Any]:
-    return {
-        "example_id": pair.example_id,
-        "prompt": pair.prompt,
-        "chosen": pair.chosen,
-        "rejected": pair.rejected,
-        "chosen_strategy_uses": [
-            item.model_dump(mode="json") for item in pair.chosen_strategy_uses
-        ],
-        "rejected_strategy_id": pair.rejected_strategy_id,
-        "rejected_strategy": pair.rejected_strategy,
+        "affected_dimensions": list(record.affected_dimensions),
+        "conditional_correspondence_verified": (
+            record.conditional_correspondence_verified
+        ),
     }

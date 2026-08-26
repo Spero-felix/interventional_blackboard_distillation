@@ -1,4 +1,4 @@
-"""Minimal STATE/PLAN interventions and critique-grounded Stage D pairs."""
+"""STATE/PLAN counterfactual construction for Stage C controllability."""
 
 from __future__ import annotations
 
@@ -9,14 +9,9 @@ from typing import Literal
 
 from pydantic import Field
 
-from .backend import LLMBackend, StructuredCaller
-from .config import ANCHOR_PROTOCOL_VERSION, STRATEGY_CATALOG, AppConfig
-from .hashing import protocol_hash
-from .prompting import build_messages
 from .schemas import (
     Candidate,
     InterventionRecord,
-    MarginPair,
     MASKED_STATE_VALUE,
     Mutation,
     NonSafetyDimension,
@@ -24,44 +19,35 @@ from .schemas import (
     STATE_ANCHOR_FIELDS,
     StateBlackboard,
     StrictModel,
-    StrategyPlanSet,
     TeacherTrace,
 )
 from .teacher import TeacherRunner
 
-_NON_SAFETY_DIMENSIONS = {
-    "emotion",
-    "need",
-    "relationship",
-    "intent",
-    "specificity",
-    "timing",
-    "effectiveness",
-    "autonomy",
-    "factuality",
-    "non_template",
-}
+
+class ConditionalEffectVerdict(StrictModel):
+    condition_a_fit: bool
+    condition_b_fit: bool
+    control_effect_present: bool
+    evidence: str = Field(min_length=1)
 
 
-class PairVerdict(StrictModel):
-    preferred: Literal["A", "B", "tie"]
-    defect_dimension: NonSafetyDimension
+class StateEffectVerdict(StrictModel):
+    condition_a_fit: bool
+    condition_b_fit: bool
+    field_effect_present: bool
+    affected_dimensions: list[NonSafetyDimension] = Field(default_factory=list)
     evidence: str = Field(min_length=1)
 
 
 ExclusionReason = Literal[
     "state_not_single_field",
     "invalid_state_counterfactual",
-    "plan_cardinality",
     "plan_overlap",
     "bidirectional_disagreement",
     "safety_failure",
     "no_localized_effect",
 ]
-EffectFailureReason = Literal[
-    "bidirectional_disagreement",
-    "no_localized_effect",
-]
+EffectFailureReason = Literal["bidirectional_disagreement", "no_localized_effect"]
 StateField = Literal[
     "emotion",
     "intensity",
@@ -77,12 +63,15 @@ StateField = Literal[
 class EffectVerification:
     passed: bool
     reason: EffectFailureReason | None = None
+    affected_dimensions: tuple[NonSafetyDimension, ...] = ()
 
     def __post_init__(self) -> None:
         if self.passed and self.reason is not None:
             raise ValueError("successful verification must not have a reason")
         if not self.passed and self.reason is None:
             raise ValueError("failed verification must have a reason")
+        if not self.passed and self.affected_dimensions:
+            raise ValueError("failed verification cannot carry effect metadata")
 
 
 class InterventionExcluded(Exception):
@@ -91,22 +80,8 @@ class InterventionExcluded(Exception):
         self.reason = reason
 
 
-def stable_seed(example_id: str, global_seed: int, protocol_version: str) -> int:
-    return int(
-        protocol_hash(
-            {
-                "example_id": example_id,
-                "global_seed": global_seed,
-                "protocol_version": protocol_version,
-            }
-        ),
-        16,
-    )
-
-
 def mask_state_field(
-    state: StateBlackboard,
-    field: StateField,
+    state: StateBlackboard, field: StateField
 ) -> tuple[StateBlackboard, Mutation]:
     before = getattr(state, field)
     mutated = state.model_copy(update={field: MASKED_STATE_VALUE})
@@ -130,17 +105,14 @@ def replace_state_field(
         raise ValueError("contrastive STATE replacement must not be empty")
     if normalized == MASKED_STATE_VALUE:
         raise ValueError("contrastive STATE replacement must not use <MASKED>")
-
     before = getattr(state, field)
     if normalized == before:
         raise ValueError("contrastive STATE replacement must differ from the original")
-
     payload = state.model_dump(mode="json")
     payload[field] = normalized
     mutated = StateBlackboard.model_validate(payload)
     changed = {
-        key
-        for key, value in state.model_dump(mode="json").items()
+        key for key, value in state.model_dump(mode="json").items()
         if mutated.model_dump(mode="json")[key] != value
     }
     if changed != {field}:
@@ -155,49 +127,56 @@ def replace_state_field(
 
 def select_counterfactual_plan(
     *,
-    planned: StrategyPlanSet,
-    used: PlanSelection,
+    candidates: list[Candidate],
+    selected_candidate_id: str,
     example_id: str,
     global_seed: int,
 ) -> tuple[PlanSelection, Mutation]:
-    k = len(used.strategies)
-    selected = [
-        strategy
-        for strategy in planned.strategies
-        if strategy not in used.strategies
-    ][:k]
-    if len(selected) < k:
-        fallback = [
-            strategy
-            for strategy in STRATEGY_CATALOG
-            if strategy not in planned.strategies
-        ]
-        rng = random.Random(
-            stable_seed(example_id, global_seed, ANCHOR_PROTOCOL_VERSION)
-        )
-        rng.shuffle(fallback)
-        selected.extend(fallback[: k - len(selected)])
-    counterfactual = PlanSelection(strategies=selected)
+    selected = next(
+        (item for item in candidates if item.candidate_id == selected_candidate_id),
+        None,
+    )
+    if selected is None:
+        raise ValueError("selected candidate is absent from the candidate set")
+    alternatives = sorted(
+        (item for item in candidates if item.candidate_id != selected_candidate_id),
+        key=lambda item: item.candidate_id,
+    )
+    if len(alternatives) != 2:
+        raise ValueError("PLAN counterfactual requires exactly two unselected candidates")
+    rng = random.Random(f"{global_seed}:{example_id}")
+    counterfactual = PlanSelection.from_candidate(
+        alternatives[rng.randrange(len(alternatives))]
+    )
+    original = PlanSelection.from_candidate(selected)
     return counterfactual, Mutation(
         operation="replace_plan_categories",
         field="strategies",
-        before=list(used.strategies),
+        before=list(original.strategies),
         after=list(counterfactual.strategies),
     )
 
 
 class InterventionBuilder:
-    """Build a retained trajectory or raise a stable exclusion reason."""
+    """Build only verified conditional-response pairs."""
 
     def __init__(
         self,
         runner: TeacherRunner,
-        verify_effect: Callable[[str, str, str], EffectVerification],
+        *,
         verify_safety: Callable[[str, str], bool],
+        verify_state_effect: Callable[
+            [StateBlackboard, StateBlackboard, StateField, str, str],
+            EffectVerification,
+        ],
+        verify_plan_effect: Callable[
+            [PlanSelection, PlanSelection, str, str], EffectVerification
+        ],
     ):
         self.runner = runner
-        self.verify_effect = verify_effect
         self.verify_safety = verify_safety
+        self.verify_state_effect = verify_state_effect
+        self.verify_plan_effect = verify_plan_effect
 
     def build(
         self,
@@ -210,9 +189,7 @@ class InterventionBuilder:
         mutated_state: StateBlackboard | None = None
         mutated_plan: PlanSelection | None = None
         if function == "STATE":
-            if state_field not in STATE_ANCHOR_FIELDS:
-                raise InterventionExcluded("state_not_single_field")
-            if any(
+            if state_field not in STATE_ANCHOR_FIELDS or any(
                 getattr(trace.state, field) == MASKED_STATE_VALUE
                 for field in STATE_ANCHOR_FIELDS
             ):
@@ -232,71 +209,54 @@ class InterventionBuilder:
                 state_field,
                 dimension,
                 example_id=(
-                    f"{trace.example_id}:intervention:STATE:"
-                    f"{state_field}:counterfactual"
+                    f"{trace.example_id}:intervention:STATE:{state_field}:counterfactual"
                 ),
             )
             try:
-                state, mutation = replace_state_field(
-                    trace.state,
-                    state_field,
-                    replacement,
+                mutated_state, mutation = replace_state_field(
+                    trace.state, state_field, replacement
                 )
             except ValueError as error:
                 raise InterventionExcluded("invalid_state_counterfactual") from error
-            changed = {
-                key
-                for key, value in trace.state.model_dump(mode="json").items()
-                if state.model_dump(mode="json")[key] != value
-            }
-            if changed != {state_field}:
-                raise InterventionExcluded("state_not_single_field")
-            mutated_state = state
             downstream = self.runner.rerun_downstream(
                 trace.history,
-                state,
-                example_id=(
-                    f"{trace.example_id}:intervention:STATE:{state_field}"
-                ),
+                mutated_state,
+                example_id=f"{trace.example_id}:intervention:STATE:{state_field}",
+                clamped_state_field=state_field,
+            )
+            counterfactual_response = downstream.response
+            verification = self.verify_state_effect(
+                trace.state,
+                mutated_state,
+                state_field,
+                trace.final_response,
+                counterfactual_response,
             )
         else:
-            used = PlanSelection.from_final_answer(trace.final_answer)
-            selection, mutation = select_counterfactual_plan(
-                planned=trace.plan,
-                used=used,
+            original_plan = trace.final_selection.to_plan_selection()
+            mutated_plan, mutation = select_counterfactual_plan(
+                candidates=trace.candidates,
+                selected_candidate_id=trace.final_selection.selected_candidate_id,
                 example_id=trace.example_id,
                 global_seed=global_seed,
             )
-            if len(selection.strategies) != len(used.strategies):
-                raise InterventionExcluded("plan_cardinality")
-            if set(selection.strategies) & set(used.strategies):
+            if mutated_plan.strategies == original_plan.strategies:
                 raise InterventionExcluded("plan_overlap")
-            mutated_plan = selection
-            downstream = self.runner.run_selected_strategies(
-                example_id=f"{trace.example_id}:intervention:PLAN",
-                history=trace.history,
-                state=trace.state,
-                selection=selection,
-                reusable_candidates=trace.candidates,
+            counterfactual_candidate = next(
+                item
+                for item in trace.candidates
+                if item.strategy == mutated_plan.strategies[0]
             )
+            counterfactual_response = counterfactual_candidate.response
             dimension = "effectiveness"
-        counterfactual_response = downstream.final_answer.response
+            verification = self.verify_plan_effect(
+                original_plan,
+                mutated_plan,
+                trace.final_response,
+                counterfactual_response,
+            )
         if not self.verify_safety(trace.final_response, counterfactual_response):
             raise InterventionExcluded("safety_failure")
-        safety_reports = [
-            report
-            for report in (*trace.critiques, *downstream.critiques)
-            if report.critic == "safety"
-        ]
-        if any(
-            issues
-            for report in safety_reports
-            for issues in report.candidate_issues.values()
-        ):
-            raise InterventionExcluded("safety_failure")
-        verification = self.verify_effect(
-            trace.final_response, counterfactual_response, dimension
-        )
         if not verification.passed:
             assert verification.reason is not None
             raise InterventionExcluded(verification.reason)
@@ -309,96 +269,8 @@ class InterventionBuilder:
             full_response=trace.final_response,
             counterfactual_response=counterfactual_response,
             target_dimension=dimension,
-            localized_degradation=True,
+            affected_dimensions=list(verification.affected_dimensions),
+            localized_effect=True,
+            conditional_correspondence_verified=True,
             bidirectional_verified=True,
-        )
-
-
-class MarginPairBuilder:
-    """Choose a localized non-safety negative and verify preference in A/B and B/A order."""
-
-    def __init__(self, backend: LLMBackend, config: AppConfig):
-        self.caller = StructuredCaller(backend, config)
-
-    @staticmethod
-    def _candidate_by_id(trace: TeacherTrace, candidate_id: str) -> Candidate | None:
-        return next((item for item in trace.candidates if item.candidate_id == candidate_id), None)
-
-    def _select_negative(self, trace: TeacherTrace):
-        unsafe_ids: set[str] = set()
-        scored: list[tuple[int, str, str, str]] = []
-        for report in trace.critiques:
-            for candidate_id, issues in report.candidate_issues.items():
-                if report.critic == "safety" and issues:
-                    unsafe_ids.add(candidate_id)
-                    continue
-                if report.critic == "safety":
-                    continue
-                for issue in issues:
-                    if issue.dimension in _NON_SAFETY_DIMENSIONS:
-                        scored.append(
-                            (issue.severity, candidate_id, issue.dimension, issue.evidence)
-                        )
-        for _, candidate_id, dimension, evidence in sorted(scored, reverse=True):
-            candidate = self._candidate_by_id(trace, candidate_id)
-            if candidate is not None and candidate_id not in unsafe_ids:
-                return candidate, dimension, evidence
-        return None
-
-    def _verify_order_swap(
-        self,
-        trace: TeacherTrace,
-        rejected: Candidate,
-        dimension: str,
-    ) -> tuple[bool, PairVerdict, PairVerdict]:
-        first, _ = self.caller.call(
-            "pair_verifier",
-            build_messages(
-                "pair_verifier",
-                trace.history,
-                PairVerdict,
-                context={"A": trace.final_response, "B": rejected.response, "dimension": dimension},
-            ),
-            PairVerdict,
-            example_id=f"{trace.example_id}:margin:ab",
-        )
-        second, _ = self.caller.call(
-            "pair_verifier",
-            build_messages(
-                "pair_verifier",
-                trace.history,
-                PairVerdict,
-                context={"A": rejected.response, "B": trace.final_response, "dimension": dimension},
-            ),
-            PairVerdict,
-            example_id=f"{trace.example_id}:margin:ba",
-        )
-        valid = (
-            first.preferred == "A"
-            and second.preferred == "B"
-            and first.defect_dimension == second.defect_dimension == dimension
-        )
-        return valid, first, second
-
-    def build(self, trace: TeacherTrace) -> MarginPair | None:
-        selected = self._select_negative(trace)
-        if selected is None:
-            return None
-        rejected, dimension, evidence = selected
-        verified, first, _ = self._verify_order_swap(trace, rejected, dimension)
-        if not verified:
-            return None
-        return MarginPair(
-            example_id=trace.example_id,
-            prompt=trace.history.as_prompt(),
-            chosen=trace.final_response,
-            chosen_strategy_uses=trace.final_answer.strategy_uses,
-            rejected_candidate_id=rejected.candidate_id,
-            rejected_strategy_id=rejected.strategy_id,
-            rejected_strategy=rejected.strategy,
-            rejected=rejected.response,
-            defect_dimension=first.defect_dimension,
-            defect_evidence=evidence,
-            order_swap_verified=True,
-            safety_filter_passed=True,
         )

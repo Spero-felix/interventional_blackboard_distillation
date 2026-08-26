@@ -1,4 +1,4 @@
-"""Single-process Stage A-D optimization for the Qwen slot wrapper."""
+"""Single-process Stage A-C optimization for the Qwen slot wrapper."""
 
 from __future__ import annotations
 
@@ -8,20 +8,28 @@ from typing import Any, Literal
 
 import torch
 
-from .anchors import AnchorArtifact, validate_anchor_protocol_metadata
+from .anchors import AnchorArtifact
 from .model import QwenSlotCausalLM, SlotForwardOutput
 from .progress import track
 from .training import (
     length_normalized_score,
-    margin_alignment_loss,
     response_token_log_probs,
     stage_b_loss,
-    stage_d_loss,
-    symmetric_margin_loss,
 )
 
 
-StageName = Literal["A", "B", "C", "D"]
+def _stage_c_natural_sft_scores(
+    original_scores: torch.Tensor,
+    counterfactual_scores: torch.Tensor,
+) -> torch.Tensor:
+    if original_scores.shape != counterfactual_scores.shape:
+        raise ValueError("Stage C response score shapes must match")
+    # The natural, unclamped path always learns the factual Teacher answer.
+    # Counterfactual responses are valid conditional targets only under their clamp.
+    return original_scores
+
+
+StageName = Literal["A", "B", "C"]
 
 
 @dataclass(frozen=True)
@@ -115,8 +123,7 @@ class StageTrainer:
 
     def _require_anchors(self) -> AnchorArtifact:
         if self.anchors is None:
-            raise ValueError("Stage B-D require a frozen anchor artifact")
-        validate_anchor_protocol_metadata(self.anchors.metadata)
+            raise ValueError("Stage B-C require a frozen anchor artifact")
         return self.anchors
 
     def _replay_loss(
@@ -213,42 +220,44 @@ class StageTrainer:
 
     def _merge_pair(
         self,
-        chosen: Mapping[str, Any],
-        rejected: Mapping[str, Any],
+        original: Mapping[str, Any],
+        counterfactual: Mapping[str, Any],
     ) -> tuple[dict[str, Any], int]:
-        chosen_count = chosen["input_ids"].shape[0]
-        if rejected["input_ids"].shape[0] != chosen_count:
-            raise ValueError("chosen and rejected batches must have equal batch size")
-        target_length = max(chosen["input_ids"].shape[1], rejected["input_ids"].shape[1])
+        original_count = original["input_ids"].shape[0]
+        if counterfactual["input_ids"].shape[0] != original_count:
+            raise ValueError("response batches must have equal batch size")
+        target_length = max(
+            original["input_ids"].shape[1], counterfactual["input_ids"].shape[1]
+        )
         pad_id = int(getattr(self.model.base_model.config, "pad_token_id", 0) or 0)
         merged = {
             "input_ids": torch.cat(
                 (
-                    self._pad_pair_tensor(chosen["input_ids"], target_length=target_length, fill=pad_id),
-                    self._pad_pair_tensor(rejected["input_ids"], target_length=target_length, fill=pad_id),
+                    self._pad_pair_tensor(original["input_ids"], target_length=target_length, fill=pad_id),
+                    self._pad_pair_tensor(counterfactual["input_ids"], target_length=target_length, fill=pad_id),
                 )
             ),
             "attention_mask": torch.cat(
                 (
-                    self._pad_pair_tensor(chosen["attention_mask"], target_length=target_length, fill=0),
-                    self._pad_pair_tensor(rejected["attention_mask"], target_length=target_length, fill=0),
+                    self._pad_pair_tensor(original["attention_mask"], target_length=target_length, fill=0),
+                    self._pad_pair_tensor(counterfactual["attention_mask"], target_length=target_length, fill=0),
                 )
             ),
             "labels": torch.cat(
                 (
-                    self._pad_pair_tensor(chosen["labels"], target_length=target_length, fill=-100),
-                    self._pad_pair_tensor(rejected["labels"], target_length=target_length, fill=-100),
+                    self._pad_pair_tensor(original["labels"], target_length=target_length, fill=-100),
+                    self._pad_pair_tensor(counterfactual["labels"], target_length=target_length, fill=-100),
                 )
             ),
             "slot_positions": {
                 name: torch.cat(
-                    (chosen["slot_positions"][name], rejected["slot_positions"][name])
+                    (original["slot_positions"][name], counterfactual["slot_positions"][name])
                 )
                 for name in ("STATE", "PLAN")
             },
-            "example_ids": chosen["example_ids"] + rejected["example_ids"],
+            "example_ids": original["example_ids"] + counterfactual["example_ids"],
         }
-        return merged, chosen_count
+        return merged, original_count
 
     def _intervention_clamp(
         self,
@@ -285,7 +294,7 @@ class StageTrainer:
 
     def train_batch(self, stage: StageName, batch: Mapping[str, Any]) -> float:
         self.model.train()
-        if stage in {"B", "C", "D"}:
+        if stage in {"B", "C"}:
             self._require_anchors()
         if stage == "A":
             output = self._forward(batch)
@@ -302,30 +311,37 @@ class StageTrainer:
             functions = list(batch["functions"])
             if len(set(functions)) != 1:
                 raise ValueError("Stage C microbatch must contain one intervention function")
-            chosen = batch["chosen"]
-            rejected = batch["rejected"]
-            merged, chosen_count = self._merge_pair(chosen, rejected)
+            original = batch["original"]
+            counterfactual = batch["counterfactual"]
+            merged, original_count = self._merge_pair(original, counterfactual)
             example_ids = list(batch["example_ids"])
-            if len(functions) != chosen_count or len(example_ids) != chosen_count:
+            if len(functions) != original_count or len(example_ids) != original_count:
                 raise ValueError(
                     "Stage C functions and example IDs must match the microbatch size"
                 )
             if (
-                list(chosen["example_ids"]) != example_ids
-                or list(rejected["example_ids"]) != example_ids
+                list(original["example_ids"]) != example_ids
+                or list(counterfactual["example_ids"]) != example_ids
             ):
                 raise ValueError(
-                    "Stage C chosen, counterfactual, and intervention example IDs must match"
+                    "Stage C original, counterfactual, and intervention example IDs must match"
                 )
             normal = self._forward(merged)
             normal_scores = self._scores(normal, merged["labels"])
-            normal_chosen = normal_scores[:chosen_count]
+            normal_original = _stage_c_natural_sft_scores(
+                normal_scores[:original_count],
+                normal_scores[original_count:],
+            )
             replay = self._replay_loss(
                 normal,
                 normal_scores,
-                chosen["example_ids"],
-                count=chosen_count,
+                original["example_ids"],
+                count=original_count,
             )
+            normal_loss = -normal_original.mean() + self.replay_weight * replay
+            normal_loss_value = normal_loss.detach()
+            self._backward(normal_loss, finish_microstep=False)
+            del normal, normal_scores, normal_original, replay, normal_loss
 
             device = next(self.model.parameters()).device
             original_clamps = self._intervention_clamp(
@@ -337,6 +353,16 @@ class StageTrainer:
             )
             original_clamp = self._forward(merged, clamps=original_clamps)
             original_scores = self._scores(original_clamp, merged["labels"])
+            original_preference = torch.relu(
+                self.margin
+                - (
+                    original_scores[:original_count]
+                    - original_scores[original_count:]
+                )
+            ).mean()
+            original_preference_value = original_preference.detach()
+            self._backward(original_preference, finish_microstep=False)
+            del original_clamp, original_scores, original_preference
 
             counterfactual_clamps = self._intervention_clamp(
                 functions[0],
@@ -353,42 +379,21 @@ class StageTrainer:
                 counterfactual_clamp,
                 merged["labels"],
             )
-            preference = symmetric_margin_loss(
-                original_clamp_original_score=original_scores[:chosen_count],
-                original_clamp_counterfactual_score=original_scores[chosen_count:],
-                counterfactual_clamp_original_score=counterfactual_scores[:chosen_count],
-                counterfactual_clamp_counterfactual_score=counterfactual_scores[
-                    chosen_count:
-                ],
-                margin=self.margin,
+            counterfactual_preference = torch.relu(
+                self.margin
+                - (
+                    counterfactual_scores[original_count:]
+                    - counterfactual_scores[:original_count]
+                )
+            ).mean()
+            counterfactual_preference_value = counterfactual_preference.detach()
+            self._backward(counterfactual_preference, finish_microstep=True)
+            loss = (
+                normal_loss_value
+                + original_preference_value
+                + counterfactual_preference_value
             )
-            loss = -normal_chosen.mean() + self.replay_weight * replay + preference
-            self._backward(loss, finish_microstep=True)
-            return float(loss.detach())
-        if stage == "D":
-            chosen = batch["chosen"]
-            rejected = batch["rejected"]
-            merged, chosen_count = self._merge_pair(chosen, rejected)
-            output = self._forward(merged)
-            scores = self._scores(output, merged["labels"])
-            chosen_scores = scores[:chosen_count]
-            rejected_scores = scores[chosen_count:]
-            replay = self._replay_loss(
-                output,
-                scores,
-                chosen["example_ids"],
-                count=chosen_count,
-            )
-            loss = stage_d_loss(
-                chosen_sft=-chosen_scores.mean(),
-                chosen_scores=chosen_scores,
-                rejected_scores=rejected_scores,
-                replay_loss=replay,
-                margin=self.margin,
-                replay_weight=self.replay_weight,
-            )
-            self._backward(loss, finish_microstep=True)
-            return float(loss.detach())
+            return float(loss)
         raise ValueError(f"unknown training stage {stage}")
 
     def train_stage(

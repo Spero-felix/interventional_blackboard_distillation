@@ -2,43 +2,36 @@ import pytest
 from pydantic import ValidationError
 
 from ibd.schemas import (
-    CritiqueIssue,
-    CritiqueReport,
+    AnalysisView,
+    Candidate,
     DialogueTurn,
-    ExpertOutput,
+    FinalSelection,
+    FinalSelectionDecision,
     History,
-    InterventionRecord,
-    MarginPair,
-    Mutation,
-    StateCounterfactual,
-    StrategyUse,
+    MultiViewStateAnalysis,
+    MultiViewStateViews,
+    PlanSelection,
+    StateBlackboard,
+    StrategyPlanSet,
 )
 
 
-def test_critique_report_allows_at_most_one_issue_per_candidate():
-    issue = CritiqueIssue(
-        dimension="timing",
-        evidence="The suggestion arrives too early.",
-        severity=2,
-        suggested_revision="Ask permission first.",
-    )
-
-    with pytest.raises(ValidationError, match="at most 1 item"):
-        CritiqueReport(
-            critic="effectiveness",
-            candidate_issues={"1": [issue, issue], "2": [], "3": []},
-        )
-
-
-def test_critique_report_schema_exposes_single_issue_limit():
-    schema = CritiqueReport.model_json_schema()
-
-    issue_list = schema["properties"]["candidate_issues"]["additionalProperties"]
-    assert issue_list["maxItems"] == 1
+def _state(**overrides):
+    values = {
+        "emotion": "失落",
+        "intensity": "中等",
+        "primary_need": "被理解",
+        "support_goal": "准备坦诚沟通",
+        "readiness": "愿意探索",
+        "main_constraint": "担心对方回避",
+        "relationship_context": "亲密关系沟通僵局",
+    }
+    values.update(overrides)
+    return StateBlackboard(**values)
 
 
-def test_history_must_end_with_seeker_turn():
-    with pytest.raises(ValidationError, match="end with a seeker"):
+def test_history_must_end_with_seeker():
+    with pytest.raises(ValidationError, match="seeker"):
         History(
             turns=[
                 DialogueTurn(role="seeker", content="我有点难过"),
@@ -47,77 +40,68 @@ def test_history_must_end_with_seeker_turn():
         )
 
 
-def test_expert_rejects_fields_from_another_domain():
-    with pytest.raises(ValidationError, match="not allowed for emotion"):
-        ExpertOutput(
-            expert="emotion",
-            fields={"emotion": "失落", "relationship_pattern": "疏远"},
-            evidence=["我有点难过"],
-            uncertainties=[],
-        )
+def test_state_is_compact_normalized_and_distinct():
+    state = _state(primary_need="  希望\n被听见 ")
+    assert state.primary_need == "希望 被听见"
+    with pytest.raises(ValidationError, match="distinct"):
+        _state(emotion="需要 空间", primary_need=" 需要  空间 ")
+    with pytest.raises(ValidationError, match="at most 20 words"):
+        _state(main_constraint=" ".join(f"w{i}" for i in range(21)))
 
 
-def test_intervention_function_is_only_state_or_plan():
+def test_unified_analysis_contains_four_views_and_one_state():
+    view = lambda summary: AnalysisView(summary=summary, evidence="对话证据")
+    analysis = MultiViewStateAnalysis(
+        views=MultiViewStateViews(
+            emotion=view("失落"),
+            need=view("被理解"),
+            relationship=view("回避沟通"),
+            intent=view("准备开口"),
+        ),
+        state=_state(),
+    )
+    assert analysis.state.primary_need == "被理解"
+
+
+def test_planner_requires_exactly_three_distinct_strategies():
+    plan = StrategyPlanSet(
+        strategies=["Question", "Reflection of feelings", "Providing Suggestions"]
+    )
+    assert plan.strategy_for_id("S2") == "Reflection of feelings"
+    with pytest.raises(ValidationError, match="distinct"):
+        StrategyPlanSet(strategies=["Question", "Question", "Information"])
+
+
+def test_plan_selection_contains_exactly_one_strategy_and_intent():
+    selection = PlanSelection(
+        strategies=["Question"],
+        response_goal="明确下一步",
+        response_act="提出开放式问题",
+    )
+    assert selection.strategies == ["Question"]
     with pytest.raises(ValidationError):
-        InterventionRecord(
-            example_id="e-1",
-            function="CRITIC",
-            mutation=Mutation(
-                operation="mask_state_field",
-                field="primary_need",
-                before="被理解",
-                after="<MASKED>",
-            ),
-            full_response="完整回复",
-            counterfactual_response="退化回复",
-            target_dimension="specificity",
-            localized_degradation=True,
-            bidirectional_verified=True,
+        PlanSelection(
+            strategies=["Question", "Information"],
+            response_goal="混合",
+            response_act="混合",
         )
 
 
-def test_state_counterfactual_has_replacement_only_contract():
-    value = StateCounterfactual(replacement="ready to take immediate action")
-
-    assert value.model_dump() == {"replacement": "ready to take immediate action"}
-    with pytest.raises(ValidationError):
-        StateCounterfactual(replacement="different value", rationale="not allowed")
-
-
-def test_margin_pair_rejects_safety_as_training_dimension():
-    with pytest.raises(ValidationError):
-        MarginPair(
-            example_id="e-1",
-            prompt="用户历史",
-            chosen="更好的回复",
-            rejected_candidate_id="c2",
-            rejected="较差回复",
-            defect_dimension="safety",
-            defect_evidence="存在安全问题",
-            order_swap_verified=True,
-            safety_filter_passed=True,
-        )
-
-
-def test_margin_pair_requires_teacher_safety_filter_to_pass():
-    with pytest.raises(ValidationError, match="safety-filter-passing"):
-        MarginPair(
-            example_id="e-1",
-            prompt="用户历史",
-            chosen="更好的回复",
-            chosen_strategy_uses=[
-                StrategyUse(
-                    strategy_id="S1",
-                    strategy="Question",
-                    contribution="Invites reflection.",
-                )
-            ],
-            rejected_candidate_id="c2",
-            rejected_strategy_id="S2",
-            rejected_strategy="Information",
-            rejected="较差回复",
-            defect_dimension="timing",
-            defect_evidence="建议出现过早",
-            order_swap_verified=True,
-            safety_filter_passed=False,
-        )
+def test_final_selection_is_canonicalized_from_candidate():
+    candidate = Candidate(
+        candidate_id="2",
+        strategy_id="S2",
+        strategy="Question",
+        response="你最希望先改变什么？",
+        seed=29,
+        response_goal="明确目标",
+        response_act="询问优先改变",
+    )
+    decision = FinalSelectionDecision(
+        selected_candidate_id="2",
+        response_goal="明确目标",
+        response_act="询问优先改变",
+    )
+    selected = FinalSelection.from_candidate(candidate, decision)
+    assert selected.response == candidate.response
+    assert selected.to_plan_selection().strategies == ["Question"]

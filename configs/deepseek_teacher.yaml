@@ -1,10 +1,10 @@
-protocol_version: qwen25-socialsim-teacher-v2-role-prompts-2
+protocol_version: qwen25-socialsim-single-strategy-v3
 
 backend:
   base_url_env: OPENAI_BASE_URL
   api_key_env: OPENAI_API_KEY
   timeout_seconds: 120
-  cache_dir: cache/teacher-multistrategy
+  cache_dir: cache/teacher-single-strategy-v3
 
 default_model:
   model: deepseek-v4-pro
@@ -13,6 +13,12 @@ default_model:
   thinking_enabled: false
 
 roles:
+  multi_view_state_analyzer:
+    model: deepseek-v4-pro
+    temperature: 0.0
+    max_tokens: 1400
+    provider_json_mode: true
+    thinking_enabled: false
   state_counterfactual_generator:
     model: deepseek-v4-pro
     temperature: 0.0
@@ -37,28 +43,23 @@ roles:
     max_tokens: 800
     provider_json_mode: false
     thinking_enabled: false
-  final_integrator:
+  final_selector:
     model: deepseek-v4-pro
     temperature: 0.0
     max_tokens: 1200
     provider_json_mode: true
     thinking_enabled: false
-  emotion_critic:
-    model: deepseek-v4-pro
-    temperature: 0.0
-    max_tokens: 1000
-    thinking_enabled: false
-  effectiveness_critic:
+  safety_verifier:
     model: deepseek-v4-flash
     temperature: 0.0
     max_tokens: 1000
     thinking_enabled: false
-  safety_critic:
+  condition_effect_verifier:
     model: deepseek-v4-flash
     temperature: 0.0
-    max_tokens: 1000
+    max_tokens: 800
     thinking_enabled: false
-  pair_verifier:
+  state_effect_verifier:
     model: deepseek-v4-flash
     temperature: 0.0
     max_tokens: 800

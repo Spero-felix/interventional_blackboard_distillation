@@ -9,13 +9,11 @@ from typing import Any, Sequence
 
 from .backend import OpenAIBackend
 from .config import AppConfig
-from .export import intervention_row, margin_row, sft_row, slot_row
-from .hashing import protocol_hash
+from .export import intervention_row, sft_row, slot_row
 from .progress import track
 from .schemas import (
     History,
     InterventionRecord,
-    MarginPair,
     STATE_ANCHOR_FIELDS,
     TeacherTrace,
 )
@@ -48,9 +46,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ibd")
     commands = parser.add_subparsers(dest="command", required=True)
 
-    hash_parser = commands.add_parser("protocol-hash")
-    hash_parser.add_argument("--config", required=True)
-
     validate_parser = commands.add_parser("validate-trace")
     validate_parser.add_argument("--input", required=True)
 
@@ -60,7 +55,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--output", required=True)
 
     export_parser = commands.add_parser("export-student")
-    export_parser.add_argument("--kind", choices=("sft", "slot", "intervention", "margin"), required=True)
+    export_parser.add_argument("--kind", choices=("sft", "slot", "intervention"), required=True)
     export_parser.add_argument("--input", required=True)
     export_parser.add_argument("--output", required=True)
 
@@ -84,7 +79,6 @@ def _build_parser() -> argparse.ArgumentParser:
     intervention_parser.add_argument("--config", required=True)
     intervention_parser.add_argument("--input", required=True)
     intervention_parser.add_argument("--output", required=True)
-    intervention_parser.add_argument("--margins-output", required=True)
     intervention_parser.add_argument("--manifest", required=True)
     intervention_parser.add_argument("--global-seed", type=int, required=True)
 
@@ -97,6 +91,12 @@ def _build_parser() -> argparse.ArgumentParser:
     anchor_parser.add_argument("--device", type=int, default=0)
     anchor_parser.add_argument("--global-seed", type=int, required=True)
     anchor_parser.add_argument(
+        "--original-splits",
+        nargs="+",
+        choices=("train", "dev", "diagnostic_holdout"),
+        default=["train"],
+    )
+    anchor_parser.add_argument(
         "--diagnostic-state-field",
         choices=STATE_ANCHOR_FIELDS,
         required=True,
@@ -108,14 +108,13 @@ def _build_parser() -> argparse.ArgumentParser:
         command_parser.add_argument("--seed", type=int, required=True)
         command_parser.add_argument("--traces", required=True)
         command_parser.add_argument("--interventions", required=True)
-        command_parser.add_argument("--margins", required=True)
         command_parser.add_argument("--anchors", required=True)
         command_parser.add_argument("--run-dir", default="runs")
         command_parser.add_argument("--resume")
         command_parser.add_argument("--device", type=int, default=0)
 
     train_parser = commands.add_parser("train")
-    train_parser.add_argument("--stage", choices=("A", "B", "C", "D"), required=True)
+    train_parser.add_argument("--stage", choices=("A", "B", "C"), required=True)
     add_training_arguments(train_parser)
 
     pipeline_parser = commands.add_parser("train-pipeline")
@@ -127,7 +126,6 @@ def _build_parser() -> argparse.ArgumentParser:
     evaluate_parser.add_argument("--checkpoint", required=True)
     evaluate_parser.add_argument("--traces", required=True)
     evaluate_parser.add_argument("--interventions", required=True)
-    evaluate_parser.add_argument("--margins", required=True)
     evaluate_parser.add_argument("--anchors", required=True)
     evaluate_parser.add_argument("--intervention-manifest", required=True)
     evaluate_parser.add_argument("--output", required=True)
@@ -149,11 +147,6 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    if args.command == "protocol-hash":
-        config = AppConfig.from_yaml(args.config)
-        print(protocol_hash(config))
-        return 0
-
     if args.command == "prepare-socialsim":
         from .socialsim import load_socialsim_files
 
@@ -240,8 +233,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             rows.append(sft_row(TeacherTrace.model_validate(record)))
         elif args.kind == "slot":
             rows.append(slot_row(TeacherTrace.model_validate(record)))
-        elif args.kind == "margin":
-            rows.append(margin_row(MarginPair.model_validate(record)))
         else:
             prompt = str(record["prompt"])
             payload = {key: value for key, value in record.items() if key != "prompt"}

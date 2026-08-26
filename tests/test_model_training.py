@@ -30,6 +30,66 @@ def test_response_log_probs_mask_prompt_and_keep_only_response_tokens():
     assert token_log_probs[mask].tolist() == pytest.approx([-1.0986123] * 3)
 
 
+def test_response_log_probs_do_not_save_a_second_full_vocab_tensor():
+    from ibd.training import response_token_log_probs
+
+    logits = torch.randn(2, 4, 5, requires_grad=True)
+    labels = torch.tensor([[-100, 1, -100, 3], [-100, 2, 0, 1]])
+    saved = []
+
+    def pack(tensor):
+        saved.append((tuple(tensor.shape), tensor.untyped_storage().data_ptr()))
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        scores, _ = response_token_log_probs(logits, labels)
+        scores.sum().backward()
+
+    full_vocab_storages = {
+        storage for shape, storage in saved if shape == (2, 3, 5)
+    }
+    assert full_vocab_storages == {logits.untyped_storage().data_ptr()}
+
+
+def test_response_log_probs_match_log_softmax_values_and_gradients():
+    from ibd.training import response_token_log_probs
+
+    labels = torch.tensor([[-100, 1, -100, 3], [-100, 2, 0, 1]])
+    values = torch.tensor(
+        [
+            [
+                [0.1, -0.2, 0.3, 0.0],
+                [0.7, 0.1, -0.4, 0.2],
+                [0.0, 0.5, 0.2, -0.1],
+                [0.4, 0.3, -0.2, 0.6],
+            ],
+            [
+                [-0.3, 0.2, 0.4, 0.1],
+                [0.1, -0.5, 0.6, 0.2],
+                [0.8, 0.0, -0.1, 0.3],
+                [-0.2, 0.4, 0.5, 0.0],
+            ],
+        ],
+        dtype=torch.float64,
+    )
+    actual_logits = values.detach().clone().requires_grad_()
+    expected_logits = values.detach().clone().requires_grad_()
+
+    actual_scores, actual_mask = response_token_log_probs(actual_logits, labels)
+    shifted_labels = labels[:, 1:]
+    expected_mask = shifted_labels.ne(-100)
+    expected_scores = torch.log_softmax(expected_logits[:, :-1, :], dim=-1).gather(
+        -1, shifted_labels.masked_fill(~expected_mask, 0).unsqueeze(-1)
+    ).squeeze(-1).masked_fill(~expected_mask, 0.0)
+
+    assert torch.equal(actual_mask, expected_mask)
+    assert torch.allclose(actual_scores, expected_scores)
+
+    actual_scores.sum().backward()
+    expected_scores.sum().backward()
+    assert torch.allclose(actual_logits.grad, expected_logits.grad)
+
+
 def test_length_normalized_score_does_not_reward_shorter_sequence():
     from ibd.training import length_normalized_score
 
@@ -39,28 +99,15 @@ def test_length_normalized_score_does_not_reward_shorter_sequence():
     assert length_normalized_score(scores, mask).tolist() == pytest.approx([-0.2, -0.2])
 
 
-def test_margin_loss_is_zero_when_chosen_exceeds_required_gap():
-    from ibd.training import margin_alignment_loss
+def test_stage_c_natural_sft_always_uses_original_response_identity():
+    from ibd.trainer import _stage_c_natural_sft_scores
 
-    chosen = torch.tensor([0.9, 0.6])
-    rejected = torch.tensor([0.2, 0.3])
-
-    assert margin_alignment_loss(chosen, rejected, margin=0.25).item() == 0.0
-
-
-def test_stage_d_combines_chosen_sft_margin_and_low_weight_replay():
-    from ibd.training import stage_d_loss
-
-    result = stage_d_loss(
-        chosen_sft=torch.tensor(1.0),
-        chosen_scores=torch.tensor([0.2]),
-        rejected_scores=torch.tensor([0.1]),
-        replay_loss=torch.tensor(2.0),
-        margin=0.5,
-        replay_weight=0.1,
+    selected = _stage_c_natural_sft_scores(
+        torch.tensor([0.2, 0.3]),
+        torch.tensor([0.7, 0.8]),
     )
 
-    assert result.item() == pytest.approx(1.6)
+    assert torch.equal(selected, torch.tensor([0.2, 0.3]))
 
 
 def test_adapter_has_exactly_state_and_plan_latent_slots_and_supports_clamp():

@@ -1,8 +1,7 @@
-"""Atomic single-process checkpoints with strict stage lineage and hashes."""
+"""Atomic single-process checkpoints with strict stage lineage."""
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import random
@@ -14,16 +13,14 @@ from typing import Any, Literal, Mapping
 import torch
 from pydantic import Field
 
-from .hashing import protocol_hash
 from .schemas import StrictModel
 
 
-StageName = Literal["A", "B", "C", "D"]
+StageName = Literal["A", "B", "C"]
 _LEGAL_SOURCES: dict[StageName, set[StageName]] = {
     "A": {"A"},
     "B": {"A", "B"},
     "C": {"B", "C"},
-    "D": {"C", "D"},
 }
 
 
@@ -34,29 +31,13 @@ class CheckpointMetadata(StrictModel):
     seed: int
     epoch: int = Field(ge=0)
     global_step: int = Field(ge=0)
-    protocol_hash: str = Field(min_length=1)
-    config_hash: str = Field(min_length=1)
-    model_hash: str = Field(min_length=1)
-    tokenizer_hash: str = Field(min_length=1)
-    data_manifest_hash: str = Field(min_length=1)
-    split_hash: str = Field(min_length=1)
-    anchor_hash: str = Field(min_length=1)
     slot_layer: int = Field(ge=0)
     special_token_ids: dict[Literal["STATE", "PLAN"], int]
-    parent_checkpoint_hash: str | None = None
 
 
 def validate_stage_lineage(source_stage: StageName, target_stage: StageName) -> None:
     if source_stage not in _LEGAL_SOURCES[target_stage]:
         raise ValueError(f"cannot resume stage {target_stage} from stage {source_stage}")
-
-
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _fsync_directory(path: Path) -> None:
@@ -65,21 +46,6 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
-
-
-def _directory_hash(path: Path) -> str:
-    files = sorted(item for item in path.rglob("*") if item.is_file())
-    if not files:
-        raise ValueError(f"checkpoint artifact directory is empty: {path}")
-    return protocol_hash(
-        [
-            {
-                "path": str(item.relative_to(path)),
-                "sha256": _file_sha256(item),
-            }
-            for item in files
-        ]
-    )
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -144,23 +110,19 @@ class CheckpointManager:
         *,
         run_name: str,
         seed: int,
-        config_hash: str,
     ):
         self.run_dir = Path(run_dir)
         self.run_name = run_name
         self.seed = seed
-        self.config_hash = config_hash
         self.run_dir.mkdir(parents=True, exist_ok=True)
         owner_path = self.run_dir / "run_owner.json"
-        owner = {"run_name": run_name, "seed": seed, "config_hash": config_hash}
+        owner = {"run_name": run_name, "seed": seed}
         if owner_path.exists():
             existing = json.loads(owner_path.read_text(encoding="utf-8"))
             if existing.get("run_name") != run_name:
                 raise ValueError("run directory belongs to a different run")
             if existing.get("seed") != seed:
                 raise ValueError("run directory belongs to a different seed")
-            if existing.get("config_hash") != config_hash:
-                raise ValueError("run directory belongs to a different config")
         else:
             _atomic_json(owner_path, owner)
 
@@ -172,14 +134,11 @@ class CheckpointManager:
         optimizer: torch.optim.Optimizer | None = None,
         scheduler: Any = None,
         scaler: Any = None,
-        tokenizer: Any = None,
     ) -> Path:
         if metadata.run_name != self.run_name:
             raise ValueError("checkpoint metadata belongs to a different run")
         if metadata.seed != self.seed:
             raise ValueError("checkpoint metadata belongs to a different seed")
-        if metadata.config_hash != self.config_hash:
-            raise ValueError("checkpoint metadata belongs to a different config")
         name = f"stage-{metadata.stage}-step-{metadata.global_step}"
         target = self.run_dir / name
         if target.exists():
@@ -200,32 +159,10 @@ class CheckpointManager:
                 },
                 training_path,
             )
-            tokenizer_hash: str | None = None
-            if tokenizer is not None:
-                tokenizer_path = temporary / "tokenizer"
-                tokenizer.save_pretrained(tokenizer_path)
-                for artifact in tokenizer_path.rglob("*"):
-                    if artifact.is_file():
-                        with artifact.open("rb") as handle:
-                            os.fsync(handle.fileno())
-                _fsync_directory(tokenizer_path)
-                tokenizer_hash = _directory_hash(tokenizer_path)
-            checkpoint_hash = protocol_hash(
-                {
-                    "metadata": metadata.model_dump(mode="json"),
-                    "model_state_sha256": _file_sha256(model_path),
-                    "training_state_sha256": _file_sha256(training_path),
-                    "tokenizer_hash": tokenizer_hash,
-                }
-            )
             checkpoint_path = temporary / "checkpoint.json"
             with checkpoint_path.open("w", encoding="utf-8") as handle:
                 json.dump(
-                    {
-                        "metadata": metadata.model_dump(mode="json"),
-                        "checkpoint_hash": checkpoint_hash,
-                        "tokenizer_hash": tokenizer_hash,
-                    },
+                    {"metadata": metadata.model_dump(mode="json")},
                     handle,
                     ensure_ascii=False,
                     sort_keys=True,
@@ -264,8 +201,6 @@ class CheckpointManager:
             raise ValueError("checkpoint belongs to a different run")
         if metadata.seed != self.seed:
             raise ValueError("checkpoint belongs to a different seed")
-        if metadata.config_hash != self.config_hash:
-            raise ValueError("checkpoint belongs to a different config")
         for key, value in (expected or {}).items():
             actual = getattr(metadata, key)
             if actual != value:
@@ -273,20 +208,6 @@ class CheckpointManager:
 
         model_path = source / "model_state.pt"
         training_path = source / "training_state.pt"
-        computed_hash = protocol_hash(
-            {
-                "metadata": metadata.model_dump(mode="json"),
-                "model_state_sha256": _file_sha256(model_path),
-                "training_state_sha256": _file_sha256(training_path),
-                "tokenizer_hash": (
-                    _directory_hash(source / "tokenizer")
-                    if payload.get("tokenizer_hash") is not None
-                    else None
-                ),
-            }
-        )
-        if computed_hash != payload["checkpoint_hash"]:
-            raise ValueError("checkpoint content hash mismatch")
         model_payload = torch.load(model_path, map_location="cpu", weights_only=False)
         _restore_model_state(model, model_payload["kind"], model_payload["state"])
         training = torch.load(training_path, map_location="cpu", weights_only=False)

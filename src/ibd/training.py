@@ -1,4 +1,4 @@
-"""Loss primitives for outcome, intervention, and Stage D alignment training."""
+"""Loss primitives for Stage A/B/C training."""
 
 from __future__ import annotations
 
@@ -19,9 +19,10 @@ def response_token_log_probs(
     shifted_labels = labels[:, 1:]
     mask = shifted_labels.ne(ignore_index)
     safe_labels = shifted_labels.masked_fill(~mask, 0)
-    token_scores = F.log_softmax(shifted_logits, dim=-1).gather(
+    selected_logits = shifted_logits.gather(
         dim=-1, index=safe_labels.unsqueeze(-1)
     ).squeeze(-1)
+    token_scores = selected_logits - torch.logsumexp(shifted_logits, dim=-1)
     return token_scores.masked_fill(~mask, 0.0), mask
 
 
@@ -35,14 +36,6 @@ def length_normalized_score(
     if torch.any(lengths == 0):
         raise ValueError("every sequence must contain at least one response token")
     return (token_log_probs * response_mask).sum(dim=-1) / lengths
-
-
-def margin_alignment_loss(
-    chosen_scores: torch.Tensor,
-    rejected_scores: torch.Tensor,
-    margin: float,
-) -> torch.Tensor:
-    return torch.relu(margin - chosen_scores + rejected_scores).mean()
 
 
 def contrastive_alignment_loss(
@@ -127,22 +120,3 @@ def symmetric_margin_loss(
         )
     )
     return original_direction.mean() + counterfactual_direction.mean()
-
-
-def stage_d_loss(
-    *,
-    chosen_sft: torch.Tensor,
-    chosen_scores: torch.Tensor,
-    rejected_scores: torch.Tensor,
-    replay_loss: torch.Tensor,
-    margin: float,
-    replay_weight: float,
-) -> torch.Tensor:
-    """Chosen SFT + length-normalized hinge + low-weight Stage B/C replay."""
-    if replay_weight < 0:
-        raise ValueError("replay_weight must be non-negative")
-    return (
-        chosen_sft
-        + margin_alignment_loss(chosen_scores, rejected_scores, margin)
-        + replay_weight * replay_loss
-    )

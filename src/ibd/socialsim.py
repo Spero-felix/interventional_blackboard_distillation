@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
+import random
 from pathlib import Path
 from typing import Any, Literal, Mapping, Sequence
 
 from pydantic import Field, model_validator
 
-from .hashing import protocol_hash
 from .progress import track
 from .schemas import DialogueTurn, History, StrictModel
 
@@ -50,11 +49,6 @@ class PreparedSocialSim(StrictModel):
                     raise ValueError("conversation IDs must not cross splits")
                 seen.add(example.conversation_id)
         return self
-
-
-def stable_conversation_key(conversation_id: str, seed: int) -> str:
-    payload = f"{seed}:{conversation_id}".encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
 
 
 def _text(value: Any) -> str:
@@ -157,7 +151,8 @@ def prepare_socialsim_examples(
         except ValueError as error:
             excluded[conversation_id] = str(error)
 
-    eligible.sort(key=lambda item: (stable_conversation_key(item[0], seed), item[0]))
+    eligible.sort(key=lambda item: item[0])
+    random.Random(seed).shuffle(eligible)
     if len(eligible) < limit:
         raise ValueError(f"only {len(eligible)} eligible SocialSim conversations for limit {limit}")
     selected = eligible[:limit]
@@ -180,13 +175,6 @@ def prepare_socialsim_examples(
             )
         offset += sizes[split]
 
-    split_hash = protocol_hash(
-        {
-            "protocol_version": "socialsim-qwen-conversation-v1",
-            "seed": seed,
-            "split_ids": split_ids,
-        }
-    )
     return PreparedSocialSim(
         seed=seed,
         splits=splits,
@@ -196,7 +184,6 @@ def prepare_socialsim_examples(
             "limit": limit,
             "counts": sizes,
             "split_ids": split_ids,
-            "split_hash": split_hash,
             "eligible_count": len(eligible),
             "excluded": dict(sorted(excluded.items())),
             "profile_usage": "ID integrity only; profile content is never exported",
@@ -211,14 +198,6 @@ def _load_json_objects(path: Path) -> list[Mapping[str, Any]]:
     if not isinstance(payload, list) or not all(isinstance(item, Mapping) for item in payload):
         raise ValueError(f"Expected a JSON list of objects in {path}")
     return payload
-
-
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def load_socialsim_files(
@@ -237,8 +216,6 @@ def load_socialsim_files(
         {
             "dialogue_path": str(dialogue_source),
             "profile_path": str(profile_source),
-            "dialogue_sha256": _file_sha256(dialogue_source),
-            "profile_sha256": _file_sha256(profile_source),
         }
     )
     return prepared

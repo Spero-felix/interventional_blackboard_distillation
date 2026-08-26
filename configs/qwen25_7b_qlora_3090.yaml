@@ -1,4 +1,4 @@
-model_path: /home/wangnianxiang/models/Qwen2.5-7B-Instruct
+model_path: /homeb/wangnianxiang/models/Qwen2.5-7B-Instruct
 load_in_4bit: true
 bnb_4bit_quant_type: nf4
 bnb_4bit_use_double_quant: true
