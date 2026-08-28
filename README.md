@@ -183,3 +183,82 @@ configs/          冻结协议示例
 docs/superpowers/specs/  设计说明
 docs/superpowers/plans/  实施计划
 ```
+## 固定第一个 PLAN 候选的 2000 条实验
+
+这组实验不重新生成 Teacher 的 STATE、PLAN 或三个候选，而是从现有 2000 条
+完整轨迹中固定选择 `strategy_id == "S1"` 的候选，重建每条轨迹的
+`final_selection` 和 `final_response`。原始 `train/dev/diagnostic_holdout` 划分
+保持为 `1500/200/300`，旧数据和旧 artifact 不会被覆盖。
+
+先在 CPU 上构造并校验新轨迹：
+
+```bash
+export PYTHONPATH=src
+PY=/home/wangnianxiang/supervisor/.venv/bin/python
+
+$PY scripts/select_first_plan_candidate.py \
+  --input artifacts/full-2000/teacher-traces.jsonl \
+  --output artifacts/full-2000-first-plan/teacher-traces.jsonl
+```
+
+成功时摘要应显示总数为 2000，三个 split 分别为 1500、200、300，并且转换后
+`selected_after` 为 `{"S1": 2000}`。脚本会拒绝覆盖已有输出；如果需要重跑，请
+先人工确认并移走旧的 `artifacts/full-2000-first-plan/teacher-traces.jsonl`。
+
+旧 intervention 的自然回复和 PLAN 条件来自旧的最终选择，不能复用。必须基于新
+轨迹重新构造：
+
+```bash
+$PY -m ibd.cli build-interventions \
+  --config configs/deepseek_teacher.yaml \
+  --input artifacts/full-2000-first-plan/teacher-traces.jsonl \
+  --output artifacts/full-2000-first-plan/interventions.jsonl \
+  --manifest artifacts/full-2000-first-plan/intervention-manifest.json \
+  --global-seed 42
+```
+
+该命令会调用 Teacher API，当前不支持断点续跑。正式运行前请确认配置和 API
+环境；如中途失败，应检查输出后再决定是否移走不完整文件并整批重跑。
+
+随后重新计算 train 和 dev 的自然 anchor，以及干预和 diagnostic holdout 所需的
+clamp anchor：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 $PY -m ibd.cli precompute-anchors \
+  --config configs/experiments/c2000-from-b-lr-8e-5.yaml \
+  --traces artifacts/full-2000-first-plan/teacher-traces.jsonl \
+  --interventions artifacts/full-2000-first-plan/interventions.jsonl \
+  --output artifacts/full-2000-first-plan/anchors-train-dev.safetensors \
+  --original-splits train dev \
+  --diagnostic-state-field readiness \
+  --global-seed 42
+```
+
+`c2000-from-b-lr-8e-5.yaml` 已启用 A、B、C 三个阶段，可直接从 Base 启动完整
+训练：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 $PY -m ibd.cli train-pipeline \
+  --run-name first-plan-2000-lr-8e-5 --seed 42 \
+  --config configs/experiments/c2000-from-b-lr-8e-5.yaml \
+  --traces artifacts/full-2000-first-plan/teacher-traces.jsonl \
+  --interventions artifacts/full-2000-first-plan/interventions.jsonl \
+  --anchors artifacts/full-2000-first-plan/anchors-train-dev.safetensors
+```
+
+训练完成后，根据 `runs/first-plan-2000-lr-8e-5/` 中的开发集选择记录确定需要
+评测的 checkpoint，再运行：
+
+```bash
+CHECKPOINT=runs/first-plan-2000-lr-8e-5/stage-C-step-替换为实际步数
+
+CUDA_VISIBLE_DEVICES=0 $PY -m ibd.cli evaluate \
+  --config configs/experiments/c2000-from-b-lr-8e-5.yaml \
+  --run-name first-plan-2000-lr-8e-5 \
+  --checkpoint "$CHECKPOINT" \
+  --traces artifacts/full-2000-first-plan/teacher-traces.jsonl \
+  --interventions artifacts/full-2000-first-plan/interventions.jsonl \
+  --anchors artifacts/full-2000-first-plan/anchors-train-dev.safetensors \
+  --intervention-manifest artifacts/full-2000-first-plan/intervention-manifest.json \
+  --output artifacts/full-2000-first-plan/evaluation.json
+```
