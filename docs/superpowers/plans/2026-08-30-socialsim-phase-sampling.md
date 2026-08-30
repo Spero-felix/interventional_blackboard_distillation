@@ -137,11 +137,11 @@ git commit -m "fix: stratify SocialSim dialogue phases"
 
 - [ ] **Step 1: Expand the CLI fixture and write a failing v2 artifact test**
 
-Change `_socialsim_dialogue` to emit six alternating pairs. Update `test_prepare_socialsim_cli_writes_reproducible_artifact` to use 20 rows and split sizes `10/5/5`, pass `--early-fraction 0.1 --late-fraction 0.1`, and assert:
+Change `_socialsim_dialogue` to emit six alternating pairs. Update `test_prepare_socialsim_cli_writes_reproducible_artifact` to use 30 rows and split sizes `10/10/10`, pass `--early-fraction 0.1 --late-fraction 0.1`, and assert:
 
 ```python
 assert payload["protocol_version"] == "socialsim-qwen-conversation-v2"
-assert payload["manifest"]["phase_counts"] == {"early": 2, "middle": 16, "late": 2}
+assert payload["manifest"]["phase_counts"] == {"early": 3, "middle": 24, "late": 3}
 assert all(row["conversation_phase"] for rows in payload["splits"].values() for row in rows)
 ```
 
