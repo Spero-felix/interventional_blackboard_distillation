@@ -18,14 +18,18 @@ from .quality import (
     QualityResponse,
     ensure_manifest,
 )
+from .progress import track
 from .qwen import (
     QwenTrainingConfig,
+    StandardSFTControlConfig,
     load_qwen_base_for_generation,
     restore_qwen_for_inference,
+    restore_qwen_standard_sft_for_inference,
 )
 from .schemas import History, TeacherTrace
 from .storage import append_jsonl, read_jsonl
 from .student_data import encode_base_generation_prompt, encode_generation_prompt
+from .visible_sft import parse_visible_sft_response
 
 
 class ResponseAdapter(Protocol):
@@ -114,6 +118,45 @@ class _StudentAdapter:
             torch.cuda.empty_cache()
 
 
+class _StandardSFTAdapter:
+    def __init__(self, spec: EvaluatedModel, device: int):
+        assert spec.training_config is not None
+        assert spec.checkpoint is not None
+        assert spec.run_name is not None
+        self.config = StandardSFTControlConfig.from_yaml(spec.training_config)
+        self.loaded = restore_qwen_standard_sft_for_inference(
+            self.config,
+            checkpoint=spec.checkpoint,
+            run_name=spec.run_name,
+            device=device,
+        )
+
+    def generate(self, history: History, settings: GenerationSettings) -> str:
+        prompt = encode_base_generation_prompt(
+            self.loaded.tokenizer,
+            history,
+            max_length=self.config.max_length,
+        )
+        device = next(self.loaded.model.parameters()).device
+        prompt = {name: value.to(device) for name, value in prompt.items()}
+        generated = self.loaded.model.generate(
+            **prompt,
+            max_new_tokens=settings.max_new_tokens,
+            do_sample=False,
+            use_cache=True,
+        )
+        response_ids = generated[0, prompt["input_ids"].shape[1] :]
+        return self.loaded.tokenizer.decode(
+            response_ids, skip_special_tokens=True
+        ).strip()
+
+    def close(self) -> None:
+        del self.loaded
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 AdapterFactory = Callable[[EvaluatedModel, int], ResponseAdapter]
 
 
@@ -121,6 +164,8 @@ def _default_factories() -> dict[str, AdapterFactory]:
     return {
         "base_qwen": _BaseAdapter,
         "student_checkpoint": _StudentAdapter,
+        "standard_sft_checkpoint": _StandardSFTAdapter,
+        "visible_sft_checkpoint": _StandardSFTAdapter,
     }
 
 
@@ -181,6 +226,13 @@ def generate_quality_responses(
     factories = {**_default_factories(), **dict(adapter_factories or {})}
     failures = 0
     for spec in config.models:
+        pending = [
+            trace
+            for trace in selected
+            if (trace.split, trace.example_id, spec.model_id) not in completed
+        ]
+        if not pending:
+            continue
         adapter = None
         if spec.source != "teacher_trace":
             try:
@@ -188,10 +240,7 @@ def generate_quality_responses(
             except Exception as exc:
                 if not continue_on_error:
                     raise
-                for trace in selected:
-                    key = (trace.split, trace.example_id, spec.model_id)
-                    if key in completed:
-                        continue
+                for trace in pending:
                     append_jsonl(
                         failure_path,
                         QualityFailure(
@@ -206,18 +255,33 @@ def generate_quality_responses(
                     failures += 1
                 continue
         try:
-            for trace in selected:
-                key = (trace.split, trace.example_id, spec.model_id)
-                if key in completed:
-                    continue
+            progress = track(
+                pending,
+                desc=f"quality generate {spec.model_id}",
+                total=len(pending),
+                unit="response",
+            )
+            for trace in progress:
+                progress.set_postfix(example=trace.example_id)
                 try:
                     if spec.source == "teacher_trace":
                         response = trace.final_response
+                        raw_response = None
                         seed = None
                         reused = True
                     else:
                         assert adapter is not None
-                        response = adapter.generate(trace.history, config.generation).strip()
+                        generated = adapter.generate(trace.history, config.generation).strip()
+                        raw_response = (
+                            generated
+                            if spec.source == "visible_sft_checkpoint"
+                            else None
+                        )
+                        response = (
+                            parse_visible_sft_response(generated)
+                            if raw_response is not None
+                            else generated
+                        )
                         if not response:
                             raise ValueError("generated response is empty")
                         seed = config.generation.seed
@@ -231,6 +295,7 @@ def generate_quality_responses(
                             response_source=spec.source,
                             history=trace.history,
                             response=response,
+                            raw_response=raw_response,
                             generation_seed=seed,
                             generation_config=config.generation,
                             reused=reused,

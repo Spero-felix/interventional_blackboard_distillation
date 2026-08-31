@@ -85,6 +85,47 @@ def encode_student_example(
     }
 
 
+def encode_standard_sft_example(
+    tokenizer: Any,
+    example: Mapping[str, Any],
+    *,
+    max_length: int,
+    response_key: str = "response",
+) -> dict[str, Any]:
+    """Encode a response-only SFT example without IBD vocabulary changes."""
+    if max_length <= 0:
+        raise ValueError("max_length must be positive")
+    prompt_ids = list(
+        tokenizer.apply_chat_template(
+            history_messages(example["history"]),
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+    )
+    encoded_response = tokenizer(
+        str(example[response_key]),
+        add_special_tokens=False,
+    )
+    response_ids = list(encoded_response["input_ids"])
+    if not response_ids:
+        raise ValueError("response must contain tokens")
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_token_id is not None and response_ids[-1] != eos_token_id:
+        response_ids.append(int(eos_token_id))
+    input_ids = prompt_ids + response_ids
+    if len(input_ids) > max_length:
+        raise ValueError(
+            f"example {example.get('example_id', '<unknown>')} exceeds max_length "
+            f"({len(input_ids)} > {max_length})"
+        )
+    return {
+        "example_id": str(example["example_id"]),
+        "input_ids": input_ids,
+        "attention_mask": [1] * len(input_ids),
+        "labels": [-100] * len(prompt_ids) + response_ids,
+    }
+
+
 def encode_generation_prompt(
     tokenizer: Any,
     history: History | Mapping[str, Any],
@@ -201,6 +242,59 @@ class QwenStageCollator:
                 )
                 for name in ("STATE", "PLAN")
             },
+            "example_ids": [item["example_id"] for item in encoded],
+        }
+
+
+class StandardSFTCollator:
+    """Right-pad ordinary response-only SFT rows without latent slots."""
+
+    def __init__(
+        self,
+        tokenizer: Any,
+        *,
+        max_length: int,
+        response_key: str = "response",
+    ):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.response_key = response_key
+
+    def __call__(self, examples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        if not examples:
+            raise ValueError("cannot collate an empty batch")
+        encoded = [
+            encode_standard_sft_example(
+                self.tokenizer,
+                example,
+                max_length=self.max_length,
+                response_key=self.response_key,
+            )
+            for example in examples
+        ]
+        target_length = max(len(item["input_ids"]) for item in encoded)
+        pad_id = getattr(self.tokenizer, "pad_token_id", None)
+        if pad_id is None:
+            pad_id = getattr(self.tokenizer, "eos_token_id", None)
+        if pad_id is None:
+            raise ValueError("tokenizer must define pad_token_id or eos_token_id")
+
+        def pad(values: list[int], fill: int) -> list[int]:
+            return values + [fill] * (target_length - len(values))
+
+        return {
+            "input_ids": torch.tensor(
+                [pad(item["input_ids"], int(pad_id)) for item in encoded],
+                dtype=torch.long,
+            ),
+            "attention_mask": torch.tensor(
+                [pad(item["attention_mask"], 0) for item in encoded],
+                dtype=torch.long,
+            ),
+            "labels": torch.tensor(
+                [pad(item["labels"], -100) for item in encoded],
+                dtype=torch.long,
+            ),
             "example_ids": [item["example_id"] for item in encoded],
         }
 

@@ -24,7 +24,7 @@
 - 独立安全过滤器：只判断两个条件回复能否安全保留，不做多维评分；
 - 条件效应验证器：判断每个回复是否匹配自己的 STATE/PLAN 条件，不判断反事实回复是否“更差”。
 
-## 三阶段训练
+## A/B 主干与 B2/C 平行分支
 
 ### Stage A — Response Warm-up
 
@@ -39,6 +39,24 @@
 继续学习自然回复，同时将 `<|ibd_state|>` 与 `<|ibd_plan|>` 位置的动态隐状态分别对齐到 Teacher 的 STATE 与最终单策略 PLAN anchor。
 
 Stage B 的动机是把“产生好回复所需的内部中间变量”压进两个可定位位置。只做 Stage A 时，模型可能会回答，但无法说明两个特殊 token 是否真正承载了状态和计划；Stage B 先建立这种结构对应关系，为 Stage C 的干预检验提供对象。
+
+### Stage B2 — Anchor-conditioned Response Training
+
+B2 从完成的 B checkpoint 显式启动，和 C 是平行实验分支，不构成
+`B → B2 → C` 的串行链。它保留自然回复 CE，并额外在 Teacher anchor
+条件下学习回复：
+
+```text
+L_B2 = L_natural
+     + 0.5 * (L_original_conditioned + L_counterfactual_conditioned)
+     + 0.1 * L_alignment
+```
+
+原始条件同时钳制原始 STATE 和原始 PLAN。STATE 反事实条件钳制“变异
+STATE + 原始 PLAN”；PLAN 反事实条件钳制“原始 STATE + 变异 PLAN”。因此
+每次 B2 条件前向都钳制两个 token，但每次只改变一个语义变量。B2 只接受以
+`--state-plan-policy fixed-original` 生成、带有 `single_variable_v1` 标记的
+干预数据；这保证 STATE 反事实的 Teacher 回复是在原始 PLAN 固定时生成的。
 
 ### Stage C — Latent Controllability
 
@@ -78,6 +96,13 @@ PY=/home/wangnianxiang/supervisor/.venv/bin/python
 $PY -m ibd.cli prepare-socialsim \
   --output artifacts/socialsim/prepared.json
 
+# 2000 条 phase-balanced 正式数据：每个 split 内 early/middle/late = 10%/80%/10%
+$PY -m ibd.cli prepare-socialsim \
+  --output artifacts/full-2000-phase-balanced/prepared.json \
+  --seed 42 --limit 2000 \
+  --train-size 1500 --dev-size 200 --holdout-size 300 \
+  --early-fraction 0.1 --late-fraction 0.1
+
 $PY -m ibd.cli run-teacher \
   --config configs/deepseek_teacher.yaml \
   --input artifacts/socialsim/prepared.json \
@@ -104,9 +129,95 @@ CUDA_VISIBLE_DEVICES=0 $PY -m ibd.cli train-pipeline \
   --traces artifacts/teacher/traces.jsonl \
   --interventions artifacts/student/interventions.jsonl \
   --anchors artifacts/student/anchors.safetensors
+
+# B2 使用新建的单变量干预/anchor artifact，并从同一个已完成 B checkpoint
+# 显式分叉；不要把 B2 加进 train-pipeline。
+$PY -m ibd.cli build-interventions \
+  --config configs/deepseek_teacher.yaml \
+  --input artifacts/teacher/traces.jsonl \
+  --output artifacts/b2/interventions-single-variable.jsonl \
+  --manifest artifacts/b2/intervention-manifest.json \
+  --global-seed 42 \
+  --state-plan-policy fixed-original
+
+CUDA_VISIBLE_DEVICES=0 $PY -m ibd.cli precompute-anchors \
+  --config configs/qwen25_7b_qlora_3090.yaml \
+  --traces artifacts/teacher/traces.jsonl \
+  --interventions artifacts/b2/interventions-single-variable.jsonl \
+  --output artifacts/b2/anchors.safetensors \
+  --diagnostic-state-field readiness \
+  --original-splits train dev \
+  --global-seed 42
+
+CUDA_VISIBLE_DEVICES=0 $PY -m ibd.cli train \
+  --stage B2 \
+  --run-name seed-42 --seed 42 \
+  --config configs/qwen25_7b_qlora_3090.yaml \
+  --traces artifacts/teacher/traces.jsonl \
+  --interventions artifacts/b2/interventions-single-variable.jsonl \
+  --anchors artifacts/b2/anchors.safetensors \
+  --resume runs/seed-42/stage-B-step-24
+
+# C 仍可从这个 B checkpoint 独立启动，继续使用其原有数据/目标。
+CUDA_VISIBLE_DEVICES=0 $PY -m ibd.cli train \
+  --stage C \
+  --run-name seed-42 --seed 42 \
+  --config configs/qwen25_7b_qlora_3090.yaml \
+  --traces artifacts/teacher/traces.jsonl \
+  --interventions artifacts/student/interventions.jsonl \
+  --anchors artifacts/student/anchors.safetensors \
+  --resume runs/seed-42/stage-B-step-24
+
+# Standard SFT control for comparison with the B-8e-5 checkpoint.
+# It uses the same train/dev traces and QLoRA hyperparameters, but never adds
+# IBD tokens, trains token rows, injects slots, or uses anchors/replay loss.
+CUDA_VISIBLE_DEVICES=0 $PY -m ibd.cli train-sft-control \
+  --run-name sft-control-lr-8e-5 --seed 42 \
+  --config configs/experiments/sft-control-lr-8e-5.yaml \
+  --traces artifacts/teacher/traces.jsonl
 ```
 
-`train --stage` 和 `train-pipeline` 的运行主链只包含 A、B、C。Stage D、margin pair 及其训练损失已从代码中删除。
+新产物使用 `socialsim-qwen-conversation-v2`。manifest 中预期的
+early/middle/late 数量分别为：train `150/1200/150`、dev `20/160/20`、
+diagnostic holdout `30/240/30`，全局为 `200/1600/200`。每条样本还记录
+`conversation_phase`、`target_turn`、`target_rank` 和
+`eligible_target_count`，用于审计实际截断位置。
+
+旧 `artifacts/full-2000/teacher-traces.jsonl` 和由其生成的 intervention、anchor
+不能与新 history 混用。应从新的 prepared artifact 依次重新生成 Teacher trace、
+intervention 和 anchor；不要覆盖旧实验目录。
+
+### 可见 STATE/PLAN SFT
+
+这个实验不使用 IBD special token、anchor 或干预损失。它先导出一个可审计的
+静态 JSONL：assistant target 依次包含原始七个 STATE 属性、最终
+`selected_strategy` 和最终回复；训练和离线评测保留完整串，面向用户时只取
+`[response]` 后的文本。
+
+```bash
+$PY -m ibd.cli export-student \
+  --kind visible-sft \
+  --input artifacts/teacher/traces.jsonl \
+  --output artifacts/student/visible_sft.jsonl
+
+CUDA_VISIBLE_DEVICES=0 $PY -m ibd.cli train-sft-control \
+  --run-name visible-sft-lr-8e-5 --seed 42 \
+  --config configs/experiments/visible-sft-lr-8e-5.yaml \
+  --dataset artifacts/student/visible_sft.jsonl
+```
+
+`visible-sft` 导出只保留 `train` 和 `dev`；`diagnostic_holdout` 不会进入
+训练文件。`--dataset` 与 `--traces` 互斥：前者读取上述静态结构化目标，后者
+保留原有 response-only SFT 对照。数据格式必须严格为：
+
+```text
+[emotion]…[intensity]…[primary_need]…[support_goal]…[readiness]…[main_constraint]…[relationship_context]…[selected_strategy]…[response]…
+```
+
+`train-pipeline` 的自动主链保持 A、B、C；B2 只能通过 `train --stage B2`
+从 B checkpoint 显式启动。B2 与 C 互为平行分支，checkpoint lineage 只允许
+`B → B2/B2` 和 `B → C/C`，不允许 `B2 → C` 或 `C → B2`。Stage D、margin pair
+及其训练损失已从代码中删除。
 
 `export-student` 支持 `sft`、`slot` 和 `intervention`。Student 数据由显式白名单构造，不会泄漏 Teacher 的审计视角。
 
@@ -137,6 +248,32 @@ CUDA_VISIBLE_DEVICES=0 $PY -m ibd.cli train-pipeline \
 tokenizer：不加载 LoRA/checkpoint，也不添加 `<|ibd_state|>`、
 `<|ibd_plan|>`；只有 Student 使用训练后的结构 token。
 
+普通 SFT 对照跑完后会在 `runs/sft-control-lr-8e-5/` 保存
+`stage-SFT-step-188`、`376`、`564`、`752`。其中 step 752 与 B-8e-5 的最佳
+checkpoint 对齐；虽然对照只训练四个 epoch，cosine scheduler 仍使用原 B 实验的
+1880-step horizon。该对照刻意关闭 early stopping，确保总会写出 step 752；要将它
+加入质量评测，在 `models` 中增加：
+
+```yaml
+- model_id: standard-sft
+  source: standard_sft_checkpoint
+  training_config: experiments/sft-control-lr-8e-5.yaml
+  checkpoint: ../runs/sft-control-lr-8e-5/stage-SFT-step-752
+  run_name: sft-control-lr-8e-5
+```
+
+要在生成质量评测中加入可见结构 SFT，使用同一个标准 SFT loader，但把 source
+设为 `visible_sft_checkpoint`。评测会保存原始 completion，并只将 `[response]`
+之后的文本交给 Judge：
+
+```yaml
+- model_id: visible-sft
+  source: visible_sft_checkpoint
+  training_config: experiments/visible-sft-lr-8e-5.yaml
+  checkpoint: ../runs/visible-sft-lr-8e-5/stage-SFT-step-752
+  run_name: visible-sft-lr-8e-5
+```
+
 ```bash
 PY=/homeb/wangnianxiang/supervisor/.venv/bin/python
 export PYTHONPATH=src
@@ -163,6 +300,37 @@ $PY -m ibd.cli quality-human-summarize \
   --output artifacts/quality/human/report.json
 ```
 
+### 单独评测第一条 PLAN 的 Stage C 并合并排名
+
+`configs/quality_eval_first_c.yaml` 是显式的单模型配置：只生成并 Judge
+第一条 PLAN 实验的 Stage C checkpoint，不会重复评测 Teacher、Base、Stage B 或
+两个 SFT 对照。C 的生成和 Judge 完成后，`quality-merge` 只读取其完成结果和既有
+五模型 Judge artifact，生成新的六模型报告与按 holdout `overall` 均分排序的排名。
+
+```bash
+OUT=artifacts/quality/first-plan-c-only
+
+CUDA_VISIBLE_DEVICES=0 $PY -m ibd.cli quality-generate \
+  --config configs/quality_eval_first_c.yaml \
+  --traces artifacts/full-2000-first-plan/teacher-traces.jsonl \
+  --output-dir "$OUT/generation" \
+  --device 0
+
+$PY -m ibd.cli quality-judge \
+  --config configs/quality_eval_first_c.yaml \
+  --responses "$OUT/generation/responses.jsonl" \
+  --output-dir "$OUT/judge"
+
+$PY -m ibd.cli quality-merge \
+  --base-dir artifacts/quality/first-plan/judge \
+  --standalone-dir "$OUT/judge" \
+  --output-dir artifacts/quality/first-plan/combined-with-c
+```
+
+合并不会改写任一输入 artifact；输出目录中的 `quality_report.json` 包含六模型聚合与
+同 history 配对统计，`ranking.json` 则以 `overall` 降序、相同分数按 `model_id`
+升序排列。两份 Judge 输入都必须完整覆盖其 manifest 的 expected keys。
+
 前两个命令支持独立 artifact；生成与 Judge 还支持 `--resume` 和
 `--continue-on-error`。固定 Judge 对每条匿名回复分别给出 1–5 分的共情、相关性、
 连贯性、即时有效性和自主性评分，`overall` 由程序取五维算术平均。主报告分别呈现
@@ -183,6 +351,7 @@ configs/          冻结协议示例
 docs/superpowers/specs/  设计说明
 docs/superpowers/plans/  实施计划
 ```
+
 ## 固定第一个 PLAN 候选的 2000 条实验
 
 这组实验不重新生成 Teacher 的 STATE、PLAN 或三个候选，而是从现有 2000 条

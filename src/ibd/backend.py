@@ -117,8 +117,17 @@ class StructuredCaller:
         protocol["backend"]["resolved_base_url"] = config.backend.resolve_base_url()
         self._cache_namespace = _cache_digest(protocol)
 
-    def _cache_key(self, example_id: str, role: str) -> str:
-        return _cache_digest((example_id, role, self._cache_namespace))
+    def _cache_key(
+        self,
+        example_id: str,
+        role: str,
+        cache_variant: str | None = None,
+    ) -> str:
+        if cache_variant is None:
+            return _cache_digest((example_id, role, self._cache_namespace))
+        return _cache_digest(
+            (example_id, role, cache_variant, self._cache_namespace)
+        )
 
     def _cache_path(self, key: str, *, failure: bool = False) -> Path | None:
         if self.config.backend.cache_dir is None:
@@ -178,8 +187,13 @@ class StructuredCaller:
         *,
         seed: int | None = None,
         example_id: str | None = None,
+        cache_variant: str | None = None,
     ) -> tuple[T, list[CallRecord]]:
-        cache_key = self._cache_key(example_id, role) if example_id is not None else None
+        cache_key = (
+            self._cache_key(example_id, role, cache_variant)
+            if example_id is not None
+            else None
+        )
         if cache_key is not None:
             cached = self._read_cached(cache_key, response_model)
             if cached is not None:
@@ -266,6 +280,8 @@ class StructuredCaller:
                     "parsed": parsed.model_dump(mode="json"),
                     "record": record.model_dump(mode="json"),
                 }
+                if cache_variant is not None:
+                    cache_payload["cache_variant"] = cache_variant
                 self._memory_cache[cache_key] = cache_payload
                 path = self._cache_path(cache_key)
                 if path is not None:
@@ -274,13 +290,13 @@ class StructuredCaller:
         if cache_key is not None:
             path = self._cache_path(cache_key, failure=True)
             if path is not None:
-                self._atomic_json(
-                    path,
-                    {
-                        "example_id": example_id,
-                        "role": role,
-                        "records": [record.model_dump(mode="json") for record in records],
-                        "error": str(last_error),
-                    },
-                )
+                failure_payload = {
+                    "example_id": example_id,
+                    "role": role,
+                    "records": [record.model_dump(mode="json") for record in records],
+                    "error": str(last_error),
+                }
+                if cache_variant is not None:
+                    failure_payload["cache_variant"] = cache_variant
+                self._atomic_json(path, failure_payload)
         raise ValueError(f"{role} failed schema validation") from last_error

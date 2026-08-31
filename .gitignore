@@ -18,4 +18,5 @@ runs/
 tests/
 artifacts/
 docs/
-
+reports/
+scripts/

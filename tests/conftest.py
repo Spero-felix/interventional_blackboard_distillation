@@ -22,7 +22,20 @@ class ScriptedBackend:
                 "seed": seed,
             }
         )
-        payload = self._payload(role, seed)
+        if role == "candidate":
+            candidate_context = json.loads(messages[1]["content"])["context"]
+            candidate_id = candidate_context["candidate_id"]
+            payload = {
+                "candidate_id": candidate_id,
+                "strategy_id": candidate_context["strategy_id"],
+                "strategy": candidate_context["strategy"],
+                "response": f"候选回复-{candidate_id}",
+                "seed": seed,
+                "response_goal": f"候选目标-{candidate_id}",
+                "response_act": f"候选动作-{candidate_id}",
+            }
+        else:
+            payload = self._payload(role, seed)
         return LLMResult(text=json.dumps(payload, ensure_ascii=False), usage={"total_tokens": 10})
 
     def _payload(self, role: str, seed: int | None):

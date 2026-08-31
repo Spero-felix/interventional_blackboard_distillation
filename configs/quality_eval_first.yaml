@@ -9,24 +9,19 @@ models:
     training_config: qwen25_7b_qlora_3090.yaml
   - model_id: ibd-b-8e-5
     source: student_checkpoint
-    training_config: ../runs/ab2000-lr-8e-5/training_config.yaml
-    checkpoint: ../runs/ab2000-lr-8e-5/stage-B-step-752
-    run_name: ab2000-lr-8e-5
-  - model_id: ibd-c-8e-5
-    source: student_checkpoint
-    training_config: ../runs/ab2000-lr-8e-5/training_config-stage-C.yaml
-    checkpoint: ../runs/ab2000-lr-8e-5/stage-C-step-897
-    run_name: ab2000-lr-8e-5
+    training_config: ../runs/first-plan-ab2000-lr-8e-5/training_config.yaml
+    checkpoint: ../runs/first-plan-ab2000-lr-8e-5/stage-B-step-752
+    run_name: first-plan-ab2000-lr-8e-5
   - model_id: standard-sft-8e-5
     source: standard_sft_checkpoint
-    training_config: ../runs/sft-control-lr-8e-5/training_config.yaml
-    checkpoint: ../runs/sft-control-lr-8e-5/stage-SFT-step-752
-    run_name: sft-control-lr-8e-5
+    training_config: ../runs/first-plan-standard-sft-2000-lr-8e-5/training_config.yaml
+    checkpoint: ../runs/first-plan-standard-sft-2000-lr-8e-5/stage-SFT-step-752
+    run_name: first-plan-standard-sft-2000-lr-8e-5
   - model_id: visible-sft-2000-lr-8e-5
     source: visible_sft_checkpoint
-    training_config: ../runs/visible-sft-2000-lr-8e-5/training_config.yaml
-    checkpoint: ../runs/visible-sft-2000-lr-8e-5/stage-SFT-step-752
-    run_name: visible-sft-2000-lr-8e-5
+    training_config: ../runs/first-plan-visible-sft-2000-lr-8e-5/training_config.yaml
+    checkpoint: ../runs/first-plan-visible-sft-2000-lr-8e-5/stage-SFT-step-752
+    run_name: first-plan-visible-sft-2000-lr-8e-5
 
 generation:
   max_new_tokens: 256

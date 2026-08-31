@@ -105,3 +105,18 @@ def test_final_selection_is_canonicalized_from_candidate():
     selected = FinalSelection.from_candidate(candidate, decision)
     assert selected.response == candidate.response
     assert selected.to_plan_selection().strategies == ["Question"]
+
+
+def test_candidate_seed_is_optional_but_accepts_historical_integer_values():
+    payload = {
+        "candidate_id": "2",
+        "strategy_id": "S2",
+        "strategy": "Question",
+        "response": "What feels most manageable now?",
+        "response_goal": "clarify readiness",
+        "response_act": "ask one focused question",
+    }
+
+    assert Candidate.model_validate({**payload, "seed": 29}).seed == 29
+    assert Candidate.model_validate({**payload, "seed": None}).seed is None
+    assert Candidate.model_validate(payload).seed is None

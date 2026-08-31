@@ -290,21 +290,25 @@ def test_contrastive_alignment_uses_correct_anchor_rows_and_freezes_bank():
 
 
 def test_stage_b_combines_response_and_both_slot_alignment_losses():
-    from ibd.training import stage_b_loss
+    from ibd.training import slot_alignment_loss, stage_b_loss
 
-    state = torch.tensor([[1.0, 0.0]])
-    plan = torch.tensor([[0.0, 1.0]])
+    state = torch.tensor([[1.0, 0.0]], requires_grad=True)
+    plan = torch.tensor([[0.0, 1.0]], requires_grad=True)
+    kwargs = {
+        "state_slots": state,
+        "plan_slots": plan,
+        "state_bank": torch.eye(2),
+        "plan_bank": torch.flip(torch.eye(2), dims=[0]),
+        "positive_rows": torch.tensor([0]),
+        "temperature": 0.2,
+        "cosine_weight": 1.0,
+        "state_weight": 0.5,
+        "plan_weight": 0.25,
+    }
+    alignment = slot_alignment_loss(**kwargs)
     result = stage_b_loss(
         response_loss=torch.tensor(1.0),
-        state_slots=state,
-        plan_slots=plan,
-        state_bank=torch.eye(2),
-        plan_bank=torch.flip(torch.eye(2), dims=[0]),
-        positive_rows=torch.tensor([0]),
-        temperature=0.2,
-        cosine_weight=1.0,
-        state_weight=0.5,
-        plan_weight=0.25,
+        **kwargs,
     )
 
     expected_alignment = torch.nn.functional.cross_entropy(
@@ -313,3 +317,7 @@ def test_stage_b_combines_response_and_both_slot_alignment_losses():
     assert result.item() == pytest.approx(
         (1.0 + 0.5 * expected_alignment + 0.25 * expected_alignment).item()
     )
+    torch.testing.assert_close(result, torch.tensor(1.0) + alignment)
+    alignment.backward()
+    assert state.grad is not None
+    assert plan.grad is not None

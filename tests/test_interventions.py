@@ -78,6 +78,7 @@ def test_plan_intervention_makes_no_new_model_call(history, app_config):
         if item.strategy == record.mutated_plan.strategies[0]
     )
     assert record.counterfactual_response == expected
+    assert record.conditioning_contract == "legacy_joint_downstream_v1"
 
 
 def test_state_intervention_reruns_planner_candidates_and_selector(history, app_config):
@@ -97,13 +98,62 @@ def test_state_intervention_reruns_planner_candidates_and_selector(history, app_
     assert [call["role"] for call in backend.calls] == [
         "state_counterfactual_generator",
         "planner",
-        "candidate_1",
-        "candidate_2",
-        "candidate_3",
+        "candidate",
+        "candidate",
+        "candidate",
         "final_selector",
     ]
     assert record.mutated_state.readiness == "准备立即采取具体行动"
     assert record.affected_dimensions == ["timing"]
+    assert record.conditioning_contract == "legacy_joint_downstream_v1"
+
+
+def test_b2_state_intervention_fixes_the_original_plan(history, app_config):
+    trace = TeacherRunner(ScriptedBackend(), app_config).run("e-b2-state", history)
+    backend = ScriptedBackend()
+    builder = InterventionBuilder(
+        TeacherRunner(backend, app_config),
+        verify_safety=lambda original, counterfactual: True,
+        verify_state_effect=lambda *args: EffectVerification(passed=True),
+        verify_plan_effect=lambda *args: EffectVerification(passed=True),
+    )
+
+    record = builder.build(
+        trace,
+        "STATE",
+        state_field="readiness",
+        global_seed=17,
+        state_plan_policy="fixed_original",
+    )
+
+    assert [call["role"] for call in backend.calls] == [
+        "state_counterfactual_generator",
+        "candidate",
+    ]
+    candidate_payload = __import__("json").loads(backend.calls[-1]["messages"][1]["content"])
+    assert candidate_payload["context"]["state"]["readiness"] == "准备立即采取具体行动"
+    assert candidate_payload["context"]["fixed_plan"] == trace.final_selection.to_plan_selection().model_dump(mode="json")
+    assert record.counterfactual_response == "候选回复-1"
+    assert record.conditioning_contract == "single_variable_v1"
+
+
+def test_b2_plan_intervention_has_single_variable_contract(history, app_config):
+    trace = TeacherRunner(ScriptedBackend(), app_config).run("e-b2-plan", history)
+    builder = InterventionBuilder(
+        TeacherRunner(ScriptedBackend(), app_config),
+        verify_safety=lambda original, counterfactual: True,
+        verify_state_effect=lambda *args: EffectVerification(passed=True),
+        verify_plan_effect=lambda *args: EffectVerification(passed=True),
+    )
+
+    record = builder.build(
+        trace,
+        "PLAN",
+        global_seed=17,
+        state_plan_policy="fixed_original",
+    )
+
+    assert record.conditioning_contract == "single_variable_v1"
 
 
 def test_builder_requires_safety_and_conditional_effect(history, app_config):

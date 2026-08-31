@@ -14,6 +14,7 @@ from .progress import track
 from .training import (
     length_normalized_score,
     response_token_log_probs,
+    slot_alignment_loss,
     stage_b_loss,
 )
 
@@ -29,7 +30,7 @@ def _stage_c_natural_sft_scores(
     return original_scores
 
 
-StageName = Literal["A", "B", "C"]
+StageName = Literal["A", "B", "B2", "C"]
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,20 @@ class StageResult:
     losses: list[float]
     optimizer_steps: int
     gradient_norms: list[float]
+
+
+@dataclass(frozen=True)
+class StageEvaluation:
+    stage: StageName
+    examples: int
+    total_loss: float
+    sft_loss: float
+    replay_loss: float | None
+    natural_ce: float | None = None
+    alignment_loss: float | None = None
+    original_conditioned_ce: float | None = None
+    counterfactual_conditioned_ce: float | None = None
+    conditioned_ce: float | None = None
 
 
 def build_paged_adamw_8bit(
@@ -69,6 +84,9 @@ class StageTrainer:
         plan_weight: float = 1.0,
         margin: float = 0.5,
         replay_weight: float = 0.1,
+        b2_natural_weight: float = 1.0,
+        b2_conditioned_weight: float = 1.0,
+        b2_alignment_weight: float = 0.1,
         max_grad_norm: float = 1.0,
     ):
         if gradient_accumulation_steps <= 0:
@@ -85,6 +103,9 @@ class StageTrainer:
         self.plan_weight = plan_weight
         self.margin = margin
         self.replay_weight = replay_weight
+        self.b2_natural_weight = b2_natural_weight
+        self.b2_conditioned_weight = b2_conditioned_weight
+        self.b2_alignment_weight = b2_alignment_weight
         self.max_grad_norm = max_grad_norm
         self.micro_steps = 0
         self.optimizer_steps = 0
@@ -123,8 +144,30 @@ class StageTrainer:
 
     def _require_anchors(self) -> AnchorArtifact:
         if self.anchors is None:
-            raise ValueError("Stage B-C require a frozen anchor artifact")
+            raise ValueError("Stage B/B2/C require a frozen anchor artifact")
         return self.anchors
+
+    def _alignment_loss(
+        self,
+        output: SlotForwardOutput,
+        example_ids: list[str],
+        *,
+        count: int | None = None,
+    ) -> torch.Tensor:
+        anchors = self._require_anchors()
+        count = count or len(example_ids)
+        rows = anchors.positive_rows(example_ids[:count]).to(output.logits.device)
+        return slot_alignment_loss(
+            state_slots=output.slots.STATE[:count],
+            plan_slots=output.slots.PLAN[:count],
+            state_bank=anchors.state.to(output.logits.device),
+            plan_bank=anchors.plan.to(output.logits.device),
+            positive_rows=rows,
+            temperature=self.temperature,
+            cosine_weight=self.cosine_weight,
+            state_weight=self.state_weight,
+            plan_weight=self.plan_weight,
+        )
 
     def _replay_loss(
         self,
@@ -292,9 +335,36 @@ class StageTrainer:
             ) from error
         return {function: vectors.to(device).repeat(repeats, 1)}
 
+    def _conditioned_clamps(
+        self,
+        function: str,
+        example_ids: list[str],
+        *,
+        counterfactual: bool,
+        device: torch.device,
+    ) -> dict[str, torch.Tensor]:
+        if function not in {"STATE", "PLAN"}:
+            raise ValueError("intervention function must be STATE or PLAN")
+        return {
+            **self._intervention_clamp(
+                "STATE",
+                example_ids,
+                mutated=counterfactual and function == "STATE",
+                repeats=1,
+                device=device,
+            ),
+            **self._intervention_clamp(
+                "PLAN",
+                example_ids,
+                mutated=counterfactual and function == "PLAN",
+                repeats=1,
+                device=device,
+            ),
+        }
+
     def train_batch(self, stage: StageName, batch: Mapping[str, Any]) -> float:
         self.model.train()
-        if stage in {"B", "C"}:
+        if stage in {"B", "B2", "C"}:
             self._require_anchors()
         if stage == "A":
             output = self._forward(batch)
@@ -307,6 +377,73 @@ class StageTrainer:
             loss = self._replay_loss(output, scores, batch["example_ids"])
             self._backward(loss, finish_microstep=True)
             return float(loss.detach())
+        if stage == "B2":
+            functions = list(batch["functions"])
+            if len(set(functions)) != 1:
+                raise ValueError("Stage B2 microbatch must contain one intervention function")
+            original = batch["original"]
+            counterfactual = batch["counterfactual"]
+            example_ids = list(batch["example_ids"])
+            count = original["input_ids"].shape[0]
+            if len(functions) != count or len(example_ids) != count:
+                raise ValueError(
+                    "Stage B2 functions and example IDs must match the microbatch size"
+                )
+            if (
+                list(original["example_ids"]) != example_ids
+                or list(counterfactual["example_ids"]) != example_ids
+            ):
+                raise ValueError(
+                    "Stage B2 original, counterfactual, and intervention example IDs must match"
+                )
+
+            normal = self._forward(original)
+            natural_ce = -self._scores(normal, original["labels"]).mean()
+            alignment = self._alignment_loss(normal, example_ids)
+            natural_component = (
+                self.b2_natural_weight * natural_ce
+                + self.b2_alignment_weight * alignment
+            )
+            natural_value = natural_component.detach()
+            self._backward(natural_component, finish_microstep=False)
+            del normal, natural_ce, alignment, natural_component
+
+            device = next(self.model.parameters()).device
+            original_conditioned = self._forward(
+                original,
+                clamps=self._conditioned_clamps(
+                    functions[0],
+                    example_ids,
+                    counterfactual=False,
+                    device=device,
+                ),
+            )
+            original_ce = -self._scores(
+                original_conditioned, original["labels"]
+            ).mean()
+            original_component = 0.5 * self.b2_conditioned_weight * original_ce
+            original_value = original_component.detach()
+            self._backward(original_component, finish_microstep=False)
+            del original_conditioned, original_ce, original_component
+
+            counterfactual_conditioned = self._forward(
+                counterfactual,
+                clamps=self._conditioned_clamps(
+                    functions[0],
+                    example_ids,
+                    counterfactual=True,
+                    device=device,
+                ),
+            )
+            counterfactual_ce = -self._scores(
+                counterfactual_conditioned, counterfactual["labels"]
+            ).mean()
+            counterfactual_component = (
+                0.5 * self.b2_conditioned_weight * counterfactual_ce
+            )
+            counterfactual_value = counterfactual_component.detach()
+            self._backward(counterfactual_component, finish_microstep=True)
+            return float(natural_value + original_value + counterfactual_value)
         if stage == "C":
             functions = list(batch["functions"])
             if len(set(functions)) != 1:
@@ -431,3 +568,358 @@ class StageTrainer:
             optimizer_steps=self.optimizer_steps - start_steps,
             gradient_norms=self.gradient_norms[start_norms:],
         )
+
+    def evaluate_stage(
+        self,
+        stage: StageName,
+        batches: Iterable[Mapping[str, Any]],
+        *,
+        total: int | None = None,
+    ) -> StageEvaluation:
+        if stage not in {"A", "B", "B2", "C"}:
+            raise ValueError(f"unknown training stage {stage}")
+        self.model.eval()
+        examples = 0
+        sft_total = 0.0
+        replay_total = 0.0
+        total_loss_total = 0.0
+        alignment_total = 0.0
+        original_conditioned_total = 0.0
+        counterfactual_conditioned_total = 0.0
+        progress = track(
+            batches,
+            desc=f"evaluate stage {stage}",
+            total=total,
+            unit="batch",
+        )
+        with torch.inference_mode():
+            for batch in progress:
+                if stage == "B2":
+                    functions = list(batch["functions"])
+                    if len(set(functions)) != 1:
+                        raise ValueError("Stage B2 microbatch must contain one intervention function")
+                    original = batch["original"]
+                    counterfactual = batch["counterfactual"]
+                    example_ids = list(batch["example_ids"])
+                    count = original["input_ids"].shape[0]
+                    if len(functions) != count or len(example_ids) != count:
+                        raise ValueError(
+                            "Stage B2 functions and example IDs must match the microbatch size"
+                        )
+                    if (
+                        list(original["example_ids"]) != example_ids
+                        or list(counterfactual["example_ids"]) != example_ids
+                    ):
+                        raise ValueError(
+                            "Stage B2 original, counterfactual, and intervention example IDs must match"
+                        )
+                    normal = self._forward(original)
+                    natural_ce = -self._scores(normal, original["labels"]).mean()
+                    alignment = self._alignment_loss(normal, example_ids)
+                    device = next(self.model.parameters()).device
+                    original_conditioned = self._forward(
+                        original,
+                        clamps=self._conditioned_clamps(
+                            functions[0],
+                            example_ids,
+                            counterfactual=False,
+                            device=device,
+                        ),
+                    )
+                    original_ce = -self._scores(
+                        original_conditioned, original["labels"]
+                    ).mean()
+                    counterfactual_conditioned = self._forward(
+                        counterfactual,
+                        clamps=self._conditioned_clamps(
+                            functions[0],
+                            example_ids,
+                            counterfactual=True,
+                            device=device,
+                        ),
+                    )
+                    counterfactual_ce = -self._scores(
+                        counterfactual_conditioned, counterfactual["labels"]
+                    ).mean()
+                    conditioned_ce = 0.5 * (original_ce + counterfactual_ce)
+                    total_loss = (
+                        self.b2_natural_weight * natural_ce
+                        + self.b2_alignment_weight * alignment
+                        + self.b2_conditioned_weight * conditioned_ce
+                    )
+                    examples += count
+                    sft_total += float(natural_ce) * count
+                    alignment_total += float(alignment) * count
+                    original_conditioned_total += float(original_ce) * count
+                    counterfactual_conditioned_total += float(counterfactual_ce) * count
+                    total_loss_total += float(total_loss) * count
+                    continue
+                if stage == "C":
+                    functions = list(batch["functions"])
+                    if len(set(functions)) != 1:
+                        raise ValueError("Stage C microbatch must contain one intervention function")
+                    original = batch["original"]
+                    counterfactual = batch["counterfactual"]
+                    merged, original_count = self._merge_pair(original, counterfactual)
+                    example_ids = list(batch["example_ids"])
+                    if len(functions) != original_count or len(example_ids) != original_count:
+                        raise ValueError(
+                            "Stage C functions and example IDs must match the microbatch size"
+                        )
+                    if (
+                        list(original["example_ids"]) != example_ids
+                        or list(counterfactual["example_ids"]) != example_ids
+                    ):
+                        raise ValueError(
+                            "Stage C original, counterfactual, and intervention example IDs must match"
+                        )
+                    normal = self._forward(merged)
+                    normal_scores = self._scores(normal, merged["labels"])
+                    normal_sft_loss = -_stage_c_natural_sft_scores(
+                        normal_scores[:original_count],
+                        normal_scores[original_count:],
+                    ).mean()
+                    replay_loss = self._replay_loss(
+                        normal,
+                        normal_scores,
+                        example_ids,
+                        count=original_count,
+                    )
+                    device = next(self.model.parameters()).device
+                    original_clamp = self._forward(
+                        merged,
+                        clamps=self._intervention_clamp(
+                            functions[0],
+                            example_ids,
+                            mutated=False,
+                            repeats=2,
+                            device=device,
+                        ),
+                    )
+                    original_scores = self._scores(original_clamp, merged["labels"])
+                    original_preference = torch.relu(
+                        self.margin
+                        - (
+                            original_scores[:original_count]
+                            - original_scores[original_count:]
+                        )
+                    ).mean()
+                    counterfactual_clamp = self._forward(
+                        merged,
+                        clamps=self._intervention_clamp(
+                            functions[0],
+                            example_ids,
+                            mutated=True,
+                            repeats=2,
+                            device=device,
+                        ),
+                    )
+                    counterfactual_scores = self._scores(
+                        counterfactual_clamp,
+                        merged["labels"],
+                    )
+                    counterfactual_preference = torch.relu(
+                        self.margin
+                        - (
+                            counterfactual_scores[original_count:]
+                            - counterfactual_scores[:original_count]
+                        )
+                    ).mean()
+                    total_loss = (
+                        normal_sft_loss
+                        + self.replay_weight * replay_loss
+                        + original_preference
+                        + counterfactual_preference
+                    )
+                    examples += original_count
+                    sft_total += float(normal_sft_loss) * original_count
+                    replay_total += float(replay_loss) * original_count
+                    total_loss_total += float(total_loss) * original_count
+                    continue
+                output = self._forward(batch)
+                scores = self._scores(output, batch["labels"])
+                count = scores.shape[0]
+                sft_loss = -scores.mean()
+                examples += count
+                sft_total += float(sft_loss) * count
+                if stage == "B":
+                    replay_loss = self._replay_loss(
+                        output,
+                        scores,
+                        list(batch["example_ids"]),
+                    )
+                    replay_total += float(replay_loss) * count
+                    total_loss_total += float(replay_loss) * count
+        if examples == 0:
+            raise ValueError(f"Stage {stage} dev dataset is empty")
+        mean_sft = sft_total / examples
+        mean_replay = replay_total / examples if stage in {"B", "C"} else None
+        mean_total = (
+            total_loss_total / examples
+            if stage in {"B", "B2", "C"}
+            else mean_sft
+        )
+        mean_alignment = alignment_total / examples if stage == "B2" else None
+        mean_original_conditioned = (
+            original_conditioned_total / examples if stage == "B2" else None
+        )
+        mean_counterfactual_conditioned = (
+            counterfactual_conditioned_total / examples if stage == "B2" else None
+        )
+        return StageEvaluation(
+            stage=stage,
+            examples=examples,
+            total_loss=mean_total,
+            sft_loss=mean_sft,
+            replay_loss=mean_replay,
+            natural_ce=mean_sft if stage == "B2" else None,
+            alignment_loss=mean_alignment,
+            original_conditioned_ce=mean_original_conditioned,
+            counterfactual_conditioned_ce=mean_counterfactual_conditioned,
+            conditioned_ce=(
+                0.5 * (mean_original_conditioned + mean_counterfactual_conditioned)
+                if stage == "B2"
+                else None
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class StandardSFTResult:
+    losses: list[float]
+    optimizer_steps: int
+    gradient_norms: list[float]
+
+
+@dataclass(frozen=True)
+class StandardSFTEvaluation:
+    examples: int
+    sft_loss: float
+
+
+class StandardSFTTrainer:
+    """Response-only SFT optimizer for the base Qwen model without slots."""
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        *,
+        scheduler: Any = None,
+        scaler: Any = None,
+        gradient_accumulation_steps: int = 1,
+        max_grad_norm: float = 1.0,
+    ):
+        if gradient_accumulation_steps <= 0:
+            raise ValueError("gradient_accumulation_steps must be positive")
+        self.model = model
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.scaler = scaler
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.max_grad_norm = max_grad_norm
+        self.micro_steps = 0
+        self.optimizer_steps = 0
+        self.gradient_norms: list[float] = []
+        self.optimizer.zero_grad(set_to_none=True)
+
+    def _forward(self, batch: Mapping[str, Any]):
+        device = next(self.model.parameters()).device
+        return self.model(
+            input_ids=batch["input_ids"].to(device),
+            attention_mask=batch["attention_mask"].to(device),
+            use_cache=False,
+        )
+
+    @staticmethod
+    def _loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        token_scores, mask = response_token_log_probs(logits, labels.to(logits.device))
+        return -length_normalized_score(token_scores, mask).mean()
+
+    def _optimizer_step(self, *, remainder_scale: float = 1.0) -> None:
+        parameters = [
+            parameter
+            for parameter in self.model.parameters()
+            if parameter.requires_grad and parameter.grad is not None
+        ]
+        if not parameters:
+            raise FloatingPointError("optimizer step has no gradients")
+        if self.scaler is not None:
+            self.scaler.unscale_(self.optimizer)
+        if remainder_scale != 1.0:
+            for parameter in parameters:
+                parameter.grad.mul_(remainder_scale)
+        if any(not torch.isfinite(parameter.grad).all() for parameter in parameters):
+            raise FloatingPointError("gradient is NaN or Inf")
+        gradient_norm = torch.nn.utils.clip_grad_norm_(parameters, self.max_grad_norm)
+        if not torch.isfinite(gradient_norm):
+            raise FloatingPointError("gradient norm is NaN or Inf")
+        self.gradient_norms.append(float(gradient_norm.detach().cpu()))
+        if self.scaler is None:
+            self.optimizer.step()
+        else:
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        if self.scheduler is not None:
+            self.scheduler.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        self.optimizer_steps += 1
+
+    def train_epoch(
+        self,
+        batches: Iterable[Mapping[str, Any]],
+        *,
+        total: int | None = None,
+    ) -> StandardSFTResult:
+        self.model.train()
+        start_steps = self.optimizer_steps
+        start_norms = len(self.gradient_norms)
+        losses: list[float] = []
+        progress = track(batches, desc="train standard SFT", total=total, unit="batch")
+        for batch in progress:
+            loss = self._loss(self._forward(batch).logits, batch["labels"])
+            if not torch.isfinite(loss):
+                raise FloatingPointError("training loss is NaN or Inf")
+            scaled_loss = loss / self.gradient_accumulation_steps
+            if self.scaler is None:
+                scaled_loss.backward()
+            else:
+                self.scaler.scale(scaled_loss).backward()
+            self.micro_steps += 1
+            if self.micro_steps % self.gradient_accumulation_steps == 0:
+                self._optimizer_step()
+            losses.append(float(loss.detach()))
+            progress.set_postfix(loss=f"{losses[-1]:.4f}", step=self.optimizer_steps)
+        if not losses:
+            raise ValueError("standard SFT dataset is empty")
+        remainder = self.micro_steps % self.gradient_accumulation_steps
+        if remainder:
+            self._optimizer_step(
+                remainder_scale=self.gradient_accumulation_steps / remainder
+            )
+            self.micro_steps += self.gradient_accumulation_steps - remainder
+        return StandardSFTResult(
+            losses=losses,
+            optimizer_steps=self.optimizer_steps - start_steps,
+            gradient_norms=self.gradient_norms[start_norms:],
+        )
+
+    def evaluate(
+        self,
+        batches: Iterable[Mapping[str, Any]],
+        *,
+        total: int | None = None,
+    ) -> StandardSFTEvaluation:
+        self.model.eval()
+        examples = 0
+        loss_total = 0.0
+        progress = track(batches, desc="evaluate standard SFT", total=total, unit="batch")
+        with torch.inference_mode():
+            for batch in progress:
+                loss = self._loss(self._forward(batch).logits, batch["labels"])
+                count = batch["input_ids"].shape[0]
+                examples += count
+                loss_total += float(loss) * count
+        if not examples:
+            raise ValueError("standard SFT dev dataset is empty")
+        return StandardSFTEvaluation(examples=examples, sft_loss=loss_total / examples)

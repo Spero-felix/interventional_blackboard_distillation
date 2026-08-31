@@ -185,6 +185,7 @@ class InterventionBuilder:
         *,
         global_seed: int,
         state_field: StateField | None = None,
+        state_plan_policy: Literal["rerun", "fixed_original"] = "rerun",
     ) -> InterventionRecord:
         mutated_state: StateBlackboard | None = None
         mutated_plan: PlanSelection | None = None
@@ -218,13 +219,22 @@ class InterventionBuilder:
                 )
             except ValueError as error:
                 raise InterventionExcluded("invalid_state_counterfactual") from error
-            downstream = self.runner.rerun_downstream(
-                trace.history,
-                mutated_state,
-                example_id=f"{trace.example_id}:intervention:STATE:{state_field}",
-                clamped_state_field=state_field,
-            )
-            counterfactual_response = downstream.response
+            if state_plan_policy == "rerun":
+                downstream = self.runner.rerun_downstream(
+                    trace.history,
+                    mutated_state,
+                    example_id=f"{trace.example_id}:intervention:STATE:{state_field}",
+                    clamped_state_field=state_field,
+                )
+                counterfactual_response = downstream.response
+            else:
+                counterfactual_response = self.runner.generate_response_under_fixed_plan(
+                    trace.history,
+                    mutated_state,
+                    trace.final_selection.to_plan_selection(),
+                    clamped_state_field=state_field,
+                    example_id=f"{trace.example_id}:intervention:STATE:{state_field}",
+                )
             verification = self.verify_state_effect(
                 trace.state,
                 mutated_state,
@@ -270,6 +280,11 @@ class InterventionBuilder:
             counterfactual_response=counterfactual_response,
             target_dimension=dimension,
             affected_dimensions=list(verification.affected_dimensions),
+            conditioning_contract=(
+                "single_variable_v1"
+                if state_plan_policy == "fixed_original"
+                else "legacy_joint_downstream_v1"
+            ),
             localized_effect=True,
             conditional_correspondence_verified=True,
             bidirectional_verified=True,

@@ -65,9 +65,8 @@ def contrastive_alignment_loss(
     return classification + cosine_weight * cosine_distance
 
 
-def stage_b_loss(
+def slot_alignment_loss(
     *,
-    response_loss: torch.Tensor,
     state_slots: torch.Tensor,
     plan_slots: torch.Tensor,
     state_bank: torch.Tensor,
@@ -94,7 +93,33 @@ def stage_b_loss(
         temperature=temperature,
         cosine_weight=cosine_weight,
     )
-    return response_loss + state_weight * state_alignment + plan_weight * plan_alignment
+    return state_weight * state_alignment + plan_weight * plan_alignment
+
+
+def stage_b_loss(
+    *,
+    response_loss: torch.Tensor,
+    state_slots: torch.Tensor,
+    plan_slots: torch.Tensor,
+    state_bank: torch.Tensor,
+    plan_bank: torch.Tensor,
+    positive_rows: torch.Tensor,
+    temperature: float,
+    cosine_weight: float,
+    state_weight: float,
+    plan_weight: float,
+) -> torch.Tensor:
+    return response_loss + slot_alignment_loss(
+        state_slots=state_slots,
+        plan_slots=plan_slots,
+        state_bank=state_bank,
+        plan_bank=plan_bank,
+        positive_rows=positive_rows,
+        temperature=temperature,
+        cosine_weight=cosine_weight,
+        state_weight=state_weight,
+        plan_weight=plan_weight,
+    )
 
 
 def symmetric_margin_loss(

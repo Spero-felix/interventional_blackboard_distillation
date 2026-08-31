@@ -16,11 +16,13 @@ from pydantic import Field
 from .schemas import StrictModel
 
 
-StageName = Literal["A", "B", "C"]
+StageName = Literal["A", "B", "B2", "C", "SFT"]
 _LEGAL_SOURCES: dict[StageName, set[StageName]] = {
     "A": {"A"},
     "B": {"A", "B"},
+    "B2": {"B", "B2"},
     "C": {"B", "C"},
+    "SFT": {"SFT"},
 }
 
 
@@ -31,8 +33,8 @@ class CheckpointMetadata(StrictModel):
     seed: int
     epoch: int = Field(ge=0)
     global_step: int = Field(ge=0)
-    slot_layer: int = Field(ge=0)
-    special_token_ids: dict[Literal["STATE", "PLAN"], int]
+    slot_layer: int | None = Field(default=None, ge=0)
+    special_token_ids: dict[Literal["STATE", "PLAN"], int] | None = None
 
 
 def validate_stage_lineage(source_stage: StageName, target_stage: StageName) -> None:

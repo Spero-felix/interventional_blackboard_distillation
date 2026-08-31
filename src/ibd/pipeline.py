@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import math
 import random
+import shutil
 from argparse import Namespace
 from itertools import islice
 from pathlib import Path
@@ -38,8 +40,10 @@ from .prompting import build_messages
 from .progress import track
 from .qwen import (
     QwenTrainingConfig,
+    StandardSFTControlConfig,
     load_frozen_qwen_for_anchors,
     load_qwen_qlora,
+    load_qwen_standard_sft,
     restore_qwen_for_inference,
     validate_local_qwen_directory,
 )
@@ -57,14 +61,16 @@ from .storage import read_jsonl, write_jsonl
 from .student_data import (
     QwenPairCollator,
     QwenStageCollator,
+    StandardSFTCollator,
     encode_generation_prompt,
 )
 from .teacher import TeacherRunner
-from .trainer import StageTrainer, build_paged_adamw_8bit
+from .trainer import StandardSFTTrainer, StageTrainer, build_paged_adamw_8bit
 from .training import length_normalized_score, response_token_log_probs
+from .visible_sft import VisibleSFTDatasetRecord
 
 
-StageName = Literal["A", "B", "C"]
+StageName = Literal["A", "B", "B2", "C"]
 _STAGES: tuple[StageName, ...] = ("A", "B", "C")
 
 
@@ -126,7 +132,7 @@ def build_stage_rows(
             }
             for trace in selected_traces.values()
         ]
-    if stage == "C":
+    if stage in {"B2", "C"}:
         rows: list[dict[str, Any]] = []
         for intervention in _unique_by_id(
             interventions, label="intervention"
@@ -137,6 +143,14 @@ def build_stage_rows(
             if intervention.full_response != trace.final_response:
                 raise ValueError(
                     f"intervention full_response mismatch for {intervention.example_id}"
+                )
+            if (
+                stage == "B2"
+                and intervention.conditioning_contract != "single_variable_v1"
+            ):
+                raise ValueError(
+                    f"B2 intervention {intervention.example_id} requires "
+                    "single_variable_v1 conditioning"
                 )
             if (
                 not intervention.localized_effect
@@ -157,6 +171,20 @@ def build_stage_rows(
             )
         return rows
     raise ValueError(f"unknown training stage {stage}")
+
+
+def read_visible_sft_dataset(path: str | Path) -> list[dict[str, Any]]:
+    """Read static visible-SFT rows without permitting split or format drift."""
+
+    rows = [VisibleSFTDatasetRecord.model_validate(row) for row in read_jsonl(path)]
+    seen_ids: set[str] = set()
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        if row.example_id in seen_ids:
+            raise ValueError(f"duplicate visible-SFT example_id {row.example_id}")
+        seen_ids.add(row.example_id)
+        result.append(row.model_dump(mode="json"))
+    return result
 
 
 def _encode_in_batches(
@@ -530,6 +558,9 @@ def _command_build_interventions(args: Namespace) -> int:
     intervention_excluded: dict[str, str] = {}
     intervention_audit: list[dict[str, Any]] = []
     attempted = {"STATE": 0, "PLAN": 0}
+    state_plan_policy = getattr(args, "state_plan_policy", "rerun").replace(
+        "-", "_"
+    )
     state_attempt_index = 0
     intervention_traces = track(
         ordered,
@@ -627,6 +658,7 @@ def _command_build_interventions(args: Namespace) -> int:
                 function,
                 state_field=state_field,
                 global_seed=args.global_seed,
+                state_plan_policy=state_plan_policy,
             )
         except InterventionExcluded as error:
             intervention_excluded[trace.example_id] = error.reason
@@ -662,6 +694,7 @@ def _command_build_interventions(args: Namespace) -> int:
         args.manifest,
         {
             "protocol_version": "teacher-interventions-v1",
+            "state_plan_policy": state_plan_policy,
             "stage_ab": {
                 "retained": counts_by_split(traces),
                 "excluded": {},
@@ -719,7 +752,7 @@ def _stage_collator(stage: StageName, loaded: Any, config: QwenTrainingConfig):
     }
     if stage in {"A", "B"}:
         return QwenStageCollator(loaded.tokenizer, **common)
-    if stage == "C":
+    if stage in {"B2", "C"}:
         return QwenPairCollator(
             loaded.tokenizer,
             left_key="full_response",
@@ -729,17 +762,34 @@ def _stage_collator(stage: StageName, loaded: Any, config: QwenTrainingConfig):
     raise ValueError(f"unknown training stage {stage}")
 
 
-def _requested_stages(args: Namespace) -> list[StageName]:
+def _requested_stages(
+    args: Namespace,
+    config: QwenTrainingConfig,
+) -> list[StageName]:
     if args.command == "train":
+        if config.epochs.for_stage(args.stage) == 0:
+            raise ValueError(f"Stage {args.stage} is disabled by epochs configuration")
         return [args.stage]
+    enabled = _configured_stages(config)
     if not args.resume:
-        return list(_STAGES)
-    source_stage = _checkpoint_payload(args.resume)["metadata"]["stage"]
-    source_index = _STAGES.index(source_stage)
-    remaining = list(_STAGES[source_index + 1 :])
+        return enabled
+    source_metadata = _checkpoint_payload(args.resume)["metadata"]
+    source_stage = source_metadata["stage"]
+    source_epoch = source_metadata["epoch"]
+    if source_stage not in enabled:
+        raise ValueError(f"resume checkpoint Stage {source_stage} is disabled by configuration")
+    source_index = enabled.index(source_stage)
+    if source_epoch < config.epochs.for_stage(source_stage):
+        remaining = enabled[source_index:]
+    else:
+        remaining = enabled[source_index + 1 :]
     if not remaining:
-        raise ValueError("pipeline resume checkpoint already completed Stage C")
+        raise ValueError("pipeline resume checkpoint already completed configured stages")
     return remaining
+
+
+def _configured_stages(config: QwenTrainingConfig) -> list[StageName]:
+    return [stage for stage in _STAGES if config.epochs.for_stage(stage) > 0]
 
 
 def _stage_epoch(
@@ -764,6 +814,120 @@ def _training_batch_total(
     )
 
 
+def _optimizer_steps_per_epoch(
+    loader_length: int,
+    max_optimizer_steps: int | None,
+    gradient_accumulation_steps: int,
+) -> int:
+    microbatches = _training_batch_total(
+        loader_length,
+        max_optimizer_steps,
+        gradient_accumulation_steps,
+    )
+    return math.ceil(microbatches / gradient_accumulation_steps)
+
+
+def _scheduler_factor(
+    step: int,
+    *,
+    warmup_steps: int,
+    total_steps: int,
+) -> float:
+    if total_steps <= 0:
+        return 1.0
+    if warmup_steps > 0 and step < warmup_steps:
+        return (step + 1) / warmup_steps
+    if step >= total_steps:
+        return 0.0
+    decay_steps = max(1, total_steps - warmup_steps)
+    progress = (step - warmup_steps) / decay_steps
+    return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+def _configured_scheduler_total_steps(config: QwenTrainingConfig) -> int | None:
+    return config.scheduler_total_steps
+
+
+def _build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    *,
+    config: QwenTrainingConfig,
+    total_steps: int,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    if config.scheduler_type == "constant":
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    warmup_steps = int(total_steps * config.warmup_ratio)
+    return torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lambda step: _scheduler_factor(
+            step,
+            warmup_steps=warmup_steps,
+            total_steps=total_steps,
+        ),
+    )
+
+
+def _standard_sft_scheduler_total_steps(config: StandardSFTControlConfig) -> int:
+    return config.scheduler_total_steps
+
+
+def _stage_metric_name(stage: StageName) -> str:
+    if stage == "A":
+        return "dev_sft_loss"
+    if stage == "B":
+        return "dev_replay_loss"
+    if stage in {"B2", "C"}:
+        return "dev_total_loss"
+    raise ValueError(f"Stage {stage} has no configured dev selection metric")
+
+
+def _copy_training_config(
+    source: str | Path,
+    run_path: Path,
+    *,
+    stage: StageName,
+) -> None:
+    target = run_path / "training_config.yaml"
+    source_path = Path(source)
+    if not target.exists():
+        shutil.copy2(source_path, target)
+        return
+    if target.read_bytes() == source_path.read_bytes():
+        return
+    stage_target = run_path / f"training_config-stage-{stage}.yaml"
+    if stage_target.exists() and stage_target.read_bytes() != source_path.read_bytes():
+        raise ValueError(f"Stage {stage} training config differs from its saved config")
+    if not stage_target.exists():
+        shutil.copy2(source_path, stage_target)
+
+
+def _should_restore_scheduler(source_stage: StageName, target_stage: StageName) -> bool:
+    return source_stage == target_stage
+
+
+def _stage_trainer_kwargs(config: QwenTrainingConfig) -> dict[str, Any]:
+    return {
+        "gradient_accumulation_steps": config.gradient_accumulation_steps,
+        "temperature": config.anchor_temperature,
+        "cosine_weight": config.cosine_weight,
+        "state_weight": config.state_weight,
+        "plan_weight": config.plan_weight,
+        "margin": config.margin,
+        "replay_weight": config.replay_weight,
+        "b2_natural_weight": config.b2.natural_weight,
+        "b2_conditioned_weight": config.b2.conditioned_weight,
+        "b2_alignment_weight": config.b2.alignment_weight,
+        "max_grad_norm": config.max_grad_norm,
+    }
+
+
+def _read_epoch_metrics(checkpoint: str | Path) -> dict[str, Any]:
+    path = Path(checkpoint) / "metrics.json"
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def _command_train(args: Namespace) -> int:
     config = QwenTrainingConfig.from_yaml(args.config)
     random.seed(args.seed)
@@ -774,11 +938,84 @@ def _command_train(args: Namespace) -> int:
     anchors = AnchorArtifact.load(args.anchors)
     traces = _read_models(args.traces, TeacherTrace)
     interventions = _read_models(args.interventions, InterventionRecord)
+    stages = _requested_stages(args, config)
+    scheduler_stages = _configured_stages(config) if args.command == "train-pipeline" else stages
+    scheduler_rows = {
+        stage: build_stage_rows(stage, traces, interventions=interventions)
+        for stage in scheduler_stages
+    }
+    train_rows = {stage: scheduler_rows[stage] for stage in stages}
+    dev_rows = {
+        stage: build_stage_rows(
+            stage,
+            traces,
+            interventions=interventions,
+            splits={"dev"},
+        )
+        for stage in stages
+        if config.evaluate_dev and stage in {"A", "B", "B2", "C"}
+    }
+    for stage, rows in dev_rows.items():
+        if not rows:
+            raise ValueError(f"Stage {stage} dev dataset is empty")
+    if "B" in dev_rows:
+        missing = [
+            row["example_id"]
+            for row in dev_rows["B"]
+            if row["example_id"] not in anchors.example_to_row
+        ]
+        if missing:
+            raise ValueError(
+                "Stage B dev evaluation requires dev anchors; regenerate anchors "
+                "with --original-splits train dev"
+            )
+    for conditioned_stage in ("B2", "C"):
+        if conditioned_stage not in dev_rows:
+            continue
+        missing_original = [
+            row["example_id"]
+            for row in dev_rows[conditioned_stage]
+            if row["example_id"] not in anchors.example_to_row
+        ]
+        missing_mutated = [
+            row["example_id"]
+            for row in dev_rows[conditioned_stage]
+            if (
+                row["function"] == "STATE"
+                and row["example_id"] not in anchors.mutated_state_to_row
+            )
+            or (
+                row["function"] == "PLAN"
+                and row["example_id"] not in anchors.mutated_plan_to_row
+            )
+        ]
+        if missing_original or missing_mutated:
+            raise ValueError(
+                f"Stage {conditioned_stage} dev evaluation requires original and mutated dev anchors; "
+                "regenerate anchors from the intervention file with "
+                "--original-splits train dev"
+            )
     optimizer = build_paged_adamw_8bit(
         loaded.model,
         learning_rate=config.learning_rate,
     )
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    calculated_scheduler_steps = sum(
+        _optimizer_steps_per_epoch(
+            len(scheduler_rows[stage]),
+            config.max_optimizer_steps_per_stage,
+            config.gradient_accumulation_steps,
+        )
+        * config.epochs.for_stage(stage)
+        for stage in scheduler_stages
+    )
+    total_scheduler_steps = (
+        _configured_scheduler_total_steps(config) or calculated_scheduler_steps
+    )
+    scheduler = _build_scheduler(
+        optimizer,
+        config=config,
+        total_steps=total_scheduler_steps,
+    )
     scaler = None
     if config.bnb_4bit_compute_dtype == "float16":
         scaler = torch.amp.GradScaler("cuda")
@@ -788,13 +1025,7 @@ def _command_train(args: Namespace) -> int:
         anchors=anchors,
         scheduler=scheduler,
         scaler=scaler,
-        gradient_accumulation_steps=config.gradient_accumulation_steps,
-        temperature=config.anchor_temperature,
-        cosine_weight=config.cosine_weight,
-        state_weight=config.state_weight,
-        plan_weight=config.plan_weight,
-        margin=config.margin,
-        replay_weight=config.replay_weight,
+        **_stage_trainer_kwargs(config),
     )
     run_path = Path(args.run_dir) / args.run_name
     manager = CheckpointManager(
@@ -802,15 +1033,17 @@ def _command_train(args: Namespace) -> int:
         run_name=args.run_name,
         seed=args.seed,
     )
-    stages = _requested_stages(args)
+    _copy_training_config(args.config, run_path, stage=stages[0])
     restored_metadata: CheckpointMetadata | None = None
     if args.resume:
+        source_stage = _checkpoint_payload(args.resume)["metadata"]["stage"]
+        restore_scheduler = _should_restore_scheduler(source_stage, stages[0])
         restored_metadata = manager.load(
             args.resume,
             target_stage=stages[0],
             model=loaded.model,
             optimizer=optimizer,
-            scheduler=scheduler,
+            scheduler=scheduler if restore_scheduler else None,
             scaler=scaler,
             expected={
                 "slot_layer": config.slot_layer,
@@ -821,48 +1054,268 @@ def _command_train(args: Namespace) -> int:
         trainer.micro_steps = (
             restored_metadata.global_step * config.gradient_accumulation_steps
         )
+        if not restore_scheduler:
+            for parameter_group in optimizer.param_groups:
+                parameter_group["lr"] = config.learning_rate
     elif stages[0] != "A":
         raise ValueError(f"Stage {stages[0]} requires --resume from its legal predecessor")
 
     summaries: list[dict[str, Any]] = []
     for stage in stages:
-        epoch = _stage_epoch(stage, restored_metadata)
-        rows = build_stage_rows(
-            stage,
-            traces,
-            interventions=interventions,
+        rows = train_rows[stage]
+        first_epoch = _stage_epoch(stage, restored_metadata)
+        best_metric: float | None = None
+        bad_epochs = 0
+        if restored_metadata is not None and restored_metadata.stage == stage:
+            resumed_metrics = _read_epoch_metrics(args.resume)
+            best_metric = resumed_metrics.get("best_metric")
+            bad_epochs = int(resumed_metrics.get("bad_epochs", 0))
+        for epoch in range(first_epoch, config.epochs.for_stage(stage) + 1):
+            generator = torch.Generator().manual_seed(
+                args.seed + sum(map(ord, stage)) + epoch * 1_000_003
+            )
+            loader = DataLoader(
+                rows,
+                batch_size=config.micro_batch_size,
+                shuffle=True,
+                generator=generator,
+                collate_fn=_stage_collator(stage, loaded, config),
+            )
+            batches: Iterable[Mapping[str, Any]] = loader
+            batch_total = _training_batch_total(
+                len(loader),
+                config.max_optimizer_steps_per_stage,
+                config.gradient_accumulation_steps,
+            )
+            if config.max_optimizer_steps_per_stage is not None:
+                batches = islice(
+                    loader,
+                    config.max_optimizer_steps_per_stage
+                    * config.gradient_accumulation_steps,
+                )
+            result = trainer.train_stage(stage, batches, total=batch_total)
+            dev_metrics: dict[str, float] | None = None
+            selection_metric: float | None = None
+            metric_name: str | None = None
+            if stage in dev_rows:
+                dev_loader = DataLoader(
+                    dev_rows[stage],
+                    batch_size=config.micro_batch_size,
+                    shuffle=False,
+                    collate_fn=_stage_collator(stage, loaded, config),
+                )
+                evaluation = trainer.evaluate_stage(
+                    stage,
+                    dev_loader,
+                    total=len(dev_loader),
+                )
+                dev_metrics = {
+                    "total_loss": evaluation.total_loss,
+                    "sft_loss": evaluation.sft_loss,
+                }
+                if evaluation.replay_loss is not None:
+                    dev_metrics["replay_loss"] = evaluation.replay_loss
+                if evaluation.natural_ce is not None:
+                    dev_metrics.update(
+                        {
+                            "natural_ce": evaluation.natural_ce,
+                            "alignment_loss": evaluation.alignment_loss,
+                            "original_conditioned_ce": evaluation.original_conditioned_ce,
+                            "counterfactual_conditioned_ce": (
+                                evaluation.counterfactual_conditioned_ce
+                            ),
+                            "conditioned_ce": evaluation.conditioned_ce,
+                        }
+                    )
+                metric_name = _stage_metric_name(stage)
+                selection_metric = {
+                    "A": evaluation.sft_loss,
+                    "B": evaluation.replay_loss,
+                    "B2": evaluation.total_loss,
+                    "C": evaluation.total_loss,
+                }[stage]
+                if selection_metric is None:
+                    raise RuntimeError(f"missing selection metric for Stage {stage}")
+                improved = best_metric is None or selection_metric < best_metric
+                if improved:
+                    best_metric = selection_metric
+                    bad_epochs = 0
+                else:
+                    bad_epochs += 1
+            metadata = CheckpointMetadata(
+                stage=stage,
+                run_name=args.run_name,
+                seed=args.seed,
+                epoch=epoch,
+                global_step=trainer.optimizer_steps,
+                slot_layer=config.slot_layer,
+                special_token_ids=loaded.token_ids,
+            )
+            checkpoint = manager.save(
+                metadata,
+                model=loaded.model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+            )
+            metrics: dict[str, Any] = {
+                "stage": stage,
+                "epoch": epoch,
+                "train": {
+                    "examples": len(rows),
+                    "last_loss": result.losses[-1],
+                    "mean_loss": sum(result.losses) / len(result.losses),
+                    "optimizer_steps": result.optimizer_steps,
+                    "max_gradient_norm": max(result.gradient_norms),
+                },
+                "dev": dev_metrics,
+                "selection_metric": metric_name,
+                "selection_value": selection_metric,
+                "best_metric": best_metric,
+                "bad_epochs": bad_epochs,
+            }
+            _write_json(checkpoint / "metrics.json", metrics)
+            if selection_metric is not None and improved:
+                _write_json(
+                    run_path / f"best-{stage}.json",
+                    {
+                        "stage": stage,
+                        "metric": metric_name,
+                        "value": selection_metric,
+                        "epoch": epoch,
+                        "checkpoint": str(checkpoint),
+                    },
+                )
+            summaries.append(
+                {
+                    "stage": stage,
+                    "epoch": epoch,
+                    "examples": len(rows),
+                    "optimizer_steps": result.optimizer_steps,
+                    "last_loss": result.losses[-1],
+                    "dev": dev_metrics,
+                    "checkpoint": str(checkpoint),
+                }
+            )
+            if (
+                selection_metric is not None
+                and config.early_stopping_patience is not None
+                and bad_epochs >= config.early_stopping_patience
+            ):
+                break
+        restored_metadata = None
+    print(json.dumps(summaries, ensure_ascii=False))
+    return 0
+
+
+def _standard_sft_epoch_seed(seed: int, epoch: int) -> int:
+    if epoch <= 3:
+        return seed + ord("A") + epoch * 1_000_003
+    return seed + ord("B") + (epoch - 3) * 1_000_003
+
+
+def _command_train_sft_control(args: Namespace) -> int:
+    config = StandardSFTControlConfig.from_yaml(args.config)
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    loaded = load_qwen_standard_sft(config, device=args.device)
+    if args.dataset:
+        rows = read_visible_sft_dataset(args.dataset)
+        train_rows = [row for row in rows if row["split"] == "train"]
+        dev_rows = [row for row in rows if row["split"] == "dev"]
+    else:
+        traces = _read_models(args.traces, TeacherTrace)
+        train_rows = build_stage_rows("A", traces)
+        dev_rows = build_stage_rows("A", traces, splits={"dev"})
+    if not train_rows:
+        raise ValueError("standard SFT train dataset is empty")
+    if not dev_rows:
+        raise ValueError("standard SFT dev dataset is empty")
+    optimizer = build_paged_adamw_8bit(loaded.model, learning_rate=config.learning_rate)
+    scheduler = _build_scheduler(
+        optimizer,
+        config=config,
+        total_steps=_standard_sft_scheduler_total_steps(config),
+    )
+    scaler = (
+        torch.amp.GradScaler("cuda")
+        if config.bnb_4bit_compute_dtype == "float16"
+        else None
+    )
+    trainer = StandardSFTTrainer(
+        loaded.model,
+        optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        max_grad_norm=config.max_grad_norm,
+    )
+    run_path = Path(args.run_dir) / args.run_name
+    manager = CheckpointManager(run_path, run_name=args.run_name, seed=args.seed)
+    _copy_training_config(args.config, run_path, stage="SFT")
+    first_epoch = 1
+    best_metric: float | None = None
+    bad_epochs = 0
+    if args.resume:
+        restored = manager.load(
+            args.resume,
+            target_stage="SFT",
+            model=loaded.model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            expected={"slot_layer": None, "special_token_ids": None},
         )
-        generator = torch.Generator().manual_seed(
-            args.seed + ord(stage) + epoch * 1_000_003
-        )
+        trainer.optimizer_steps = restored.global_step
+        trainer.micro_steps = restored.global_step * config.gradient_accumulation_steps
+        first_epoch = restored.epoch + 1
+        resumed_metrics = _read_epoch_metrics(args.resume)
+        best_metric = resumed_metrics.get("best_metric")
+        bad_epochs = int(resumed_metrics.get("bad_epochs", 0))
+    summaries: list[dict[str, Any]] = []
+    for epoch in range(first_epoch, config.sft_epochs + 1):
         loader = DataLoader(
-            rows,
+            train_rows,
             batch_size=config.micro_batch_size,
             shuffle=True,
-            generator=generator,
-            collate_fn=_stage_collator(stage, loaded, config),
+            generator=torch.Generator().manual_seed(
+                _standard_sft_epoch_seed(args.seed, epoch)
+            ),
+            collate_fn=StandardSFTCollator(loaded.tokenizer, max_length=config.max_length),
         )
         batches: Iterable[Mapping[str, Any]] = loader
         batch_total = _training_batch_total(
-            len(loader),
-            config.max_optimizer_steps_per_stage,
-            config.gradient_accumulation_steps,
+            len(loader), config.max_optimizer_steps_per_stage, config.gradient_accumulation_steps
         )
         if config.max_optimizer_steps_per_stage is not None:
             batches = islice(
                 loader,
-                config.max_optimizer_steps_per_stage
-                * config.gradient_accumulation_steps,
+                config.max_optimizer_steps_per_stage * config.gradient_accumulation_steps,
             )
-        result = trainer.train_stage(stage, batches, total=batch_total)
+        result = trainer.train_epoch(batches, total=batch_total)
+        dev_loader = DataLoader(
+            dev_rows,
+            batch_size=config.micro_batch_size,
+            shuffle=False,
+            collate_fn=StandardSFTCollator(loaded.tokenizer, max_length=config.max_length),
+        )
+        evaluation = trainer.evaluate(dev_loader, total=len(dev_loader))
+        selection_value = evaluation.sft_loss
+        improved = best_metric is None or selection_value < best_metric
+        if improved:
+            best_metric = selection_value
+            bad_epochs = 0
+        else:
+            bad_epochs += 1
         metadata = CheckpointMetadata(
-            stage=stage,
+            checkpoint_version="qwen-standard-sft-control-v1",
+            stage="SFT",
             run_name=args.run_name,
             seed=args.seed,
             epoch=epoch,
             global_step=trainer.optimizer_steps,
-            slot_layer=config.slot_layer,
-            special_token_ids=loaded.token_ids,
         )
         checkpoint = manager.save(
             metadata,
@@ -871,20 +1324,40 @@ def _command_train(args: Namespace) -> int:
             scheduler=scheduler,
             scaler=scaler,
         )
-        summaries.append(
-            {
-                "stage": stage,
-                "examples": len(rows),
-                "optimizer_steps": result.optimizer_steps,
+        metrics = {
+            "stage": "SFT",
+            "epoch": epoch,
+            "train": {
+                "examples": len(train_rows),
                 "last_loss": result.losses[-1],
+                "mean_loss": sum(result.losses) / len(result.losses),
+                "optimizer_steps": result.optimizer_steps,
                 "max_gradient_norm": max(result.gradient_norms),
-                "total_parameters": loaded.total_parameters,
-                "trainable_parameters": loaded.trainable_parameters,
-                "lora_parameters": loaded.lora_parameters,
-                "token_row_parameters": loaded.token_row_parameters,
-                "checkpoint": str(checkpoint),
-            }
-        )
+            },
+            "dev": {"sft_loss": selection_value, "total_loss": selection_value},
+            "selection_metric": "dev_sft_loss",
+            "selection_value": selection_value,
+            "best_metric": best_metric,
+            "bad_epochs": bad_epochs,
+        }
+        _write_json(checkpoint / "metrics.json", metrics)
+        if improved:
+            _write_json(
+                run_path / "best-SFT.json",
+                {
+                    "stage": "SFT",
+                    "metric": "dev_sft_loss",
+                    "value": selection_value,
+                    "epoch": epoch,
+                    "checkpoint": str(checkpoint),
+                },
+            )
+        summaries.append({"stage": "SFT", "epoch": epoch, "checkpoint": str(checkpoint)})
+        if (
+            config.early_stopping_patience is not None
+            and bad_epochs >= config.early_stopping_patience
+        ):
+            break
     print(json.dumps(summaries, ensure_ascii=False))
     return 0
 
@@ -1186,6 +1659,8 @@ def run_pipeline_command(args: Namespace) -> int:
         return _command_precompute_anchors(args)
     if args.command in {"train", "train-pipeline"}:
         return _command_train(args)
+    if args.command == "train-sft-control":
+        return _command_train_sft_control(args)
     if args.command == "evaluate":
         return _command_evaluate(args)
     if args.command == "generate":

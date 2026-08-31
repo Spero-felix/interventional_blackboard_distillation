@@ -15,6 +15,7 @@ from pydantic import Field, model_validator
 
 from .config import AppConfig, BackendConfig, ModelConfig
 from .schemas import CallRecord, History, StrictModel
+from .visible_sft import parse_visible_sft_response
 
 
 QUALITY_PROTOCOL_VERSION = "generation-quality-v1"
@@ -28,7 +29,13 @@ QUALITY_DIMENSIONS = (
 )
 
 QualitySplit = Literal["dev", "diagnostic_holdout"]
-ResponseSource = Literal["teacher_trace", "base_qwen", "student_checkpoint"]
+ResponseSource = Literal[
+    "teacher_trace",
+    "base_qwen",
+    "student_checkpoint",
+    "standard_sft_checkpoint",
+    "visible_sft_checkpoint",
+]
 
 
 class GenerationSettings(StrictModel):
@@ -56,7 +63,7 @@ class EvaluatedModel(StrictModel):
                 raise ValueError("base_qwen must use the original model without a checkpoint")
         elif not all((self.training_config, self.checkpoint, self.run_name)):
             raise ValueError(
-                "student_checkpoint requires training_config, checkpoint, and run_name"
+                f"{self.source} requires training_config, checkpoint, and run_name"
             )
         return self
 
@@ -64,7 +71,8 @@ class EvaluatedModel(StrictModel):
 class QualityEvalConfig(StrictModel):
     protocol_version: Literal["generation-quality-v1"] = QUALITY_PROTOCOL_VERSION
     splits: tuple[QualitySplit, ...] = ("dev", "diagnostic_holdout")
-    models: list[EvaluatedModel] = Field(min_length=2)
+    standalone: bool = False
+    models: list[EvaluatedModel] = Field(min_length=1)
     generation: GenerationSettings = Field(default_factory=GenerationSettings)
     backend: BackendConfig = Field(default_factory=BackendConfig)
     judge: ModelConfig
@@ -79,8 +87,19 @@ class QualityEvalConfig(StrictModel):
         model_ids = [item.model_id for item in self.models]
         if len(set(model_ids)) != len(model_ids):
             raise ValueError("quality model_id values must be unique")
-        if sum(item.source == "teacher_trace" for item in self.models) != 1:
-            raise ValueError("generation-quality-v1 requires exactly one teacher_trace")
+        teacher_count = sum(item.source == "teacher_trace" for item in self.models)
+        if self.standalone:
+            if len(self.models) != 1:
+                raise ValueError("standalone quality evaluation requires exactly one model")
+            if teacher_count:
+                raise ValueError("standalone quality evaluation must not evaluate teacher_trace")
+        else:
+            if len(self.models) < 2:
+                raise ValueError(
+                    "non-standalone quality evaluation requires at least two models"
+                )
+            if teacher_count != 1:
+                raise ValueError("generation-quality-v1 requires exactly one teacher_trace")
         if len(set(self.splits)) != len(self.splits):
             raise ValueError("quality splits must be unique")
         return self
@@ -127,6 +146,7 @@ class QualityResponse(StrictModel):
     response_source: ResponseSource
     history: History
     response: str = Field(min_length=1)
+    raw_response: str | None = None
     generation_seed: int | None = None
     generation_config: GenerationSettings
     reused: bool = False
@@ -138,6 +158,13 @@ class QualityResponse(StrictModel):
                 raise ValueError("teacher_trace responses must be marked reused without a seed")
         elif self.reused or self.generation_seed is None:
             raise ValueError("locally generated responses require a seed and reused=false")
+        if self.response_source == "visible_sft_checkpoint":
+            if self.raw_response is None:
+                raise ValueError("visible_sft_checkpoint requires raw_response")
+            if parse_visible_sft_response(self.raw_response) != self.response:
+                raise ValueError("visible-SFT raw_response does not match response suffix")
+        elif self.raw_response is not None:
+            raise ValueError("only visible_sft_checkpoint may include raw_response")
         return self
 
 

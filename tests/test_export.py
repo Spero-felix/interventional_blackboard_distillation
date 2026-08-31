@@ -1,7 +1,7 @@
 import pytest
 
 from conftest import ScriptedBackend
-from ibd.export import intervention_row, sft_row, slot_row
+from ibd.export import intervention_row, sft_row, slot_row, visible_sft_row
 from ibd.interventions import EffectVerification, InterventionBuilder
 from ibd.teacher import TeacherRunner
 
@@ -22,6 +22,48 @@ def test_slot_export_contains_only_state_and_final_single_plan(history, app_conf
     assert set(row) == {"example_id", "prompt", "state", "plan"}
     assert row["plan"]["strategies"] == [trace.final_selection.selected_strategy]
     assert "views" not in row
+
+
+def test_visible_sft_target_preserves_state_strategy_and_response(history, app_config):
+    from ibd.visible_sft import parse_visible_sft_response, serialize_visible_sft
+
+    trace = TeacherRunner(ScriptedBackend(), app_config).run("e-visible", history)
+
+    assert serialize_visible_sft(trace) == (
+        f"[emotion]{trace.state.emotion}"
+        f"[intensity]{trace.state.intensity}"
+        f"[primary_need]{trace.state.primary_need}"
+        f"[support_goal]{trace.state.support_goal}"
+        f"[readiness]{trace.state.readiness}"
+        f"[main_constraint]{trace.state.main_constraint}"
+        f"[relationship_context]{trace.state.relationship_context}"
+        f"[selected_strategy]{trace.final_selection.selected_strategy}"
+        f"[response]{trace.final_response}"
+    )
+    assert parse_visible_sft_response(serialize_visible_sft(trace)) == trace.final_response
+
+
+def test_visible_sft_response_parser_rejects_missing_or_empty_marker():
+    from ibd.visible_sft import parse_visible_sft_response
+
+    with pytest.raises(ValueError, match=r"\[response\]"):
+        parse_visible_sft_response("[emotion]sad")
+    with pytest.raises(ValueError, match="must not be empty"):
+        parse_visible_sft_response("[response]")
+
+
+def test_visible_sft_export_keeps_native_history_and_split(history, app_config):
+    trace = TeacherRunner(ScriptedBackend(), app_config).run(
+        "e-visible-row", history, split="dev"
+    )
+
+    row = visible_sft_row(trace)
+
+    assert set(row) == {"example_id", "split", "history", "response"}
+    assert row["example_id"] == "e-visible-row"
+    assert row["split"] == "dev"
+    assert row["history"] == history.model_dump(mode="json")
+    assert row["response"].endswith("[response]" + trace.final_response)
 
 
 @pytest.mark.parametrize("split", ["test", "diagnostic_holdout"])

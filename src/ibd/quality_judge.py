@@ -8,6 +8,7 @@ from pathlib import Path
 from pydantic import Field
 
 from .backend import LLMBackend, OpenAIBackend, StructuredCaller
+from .progress import track
 from .quality import (
     QUALITY_DIMENSIONS,
     QualityDimensionReasons,
@@ -200,10 +201,20 @@ def judge_quality_responses(
 
     evaluator = QualityJudge(backend or OpenAIBackend(config.judge_app_config()), config)
     failed_keys: set[tuple[str, str, str]] = set()
-    for index, response in enumerate(ordered, start=1):
+    pending = [
+        (index, response)
+        for index, response in enumerate(ordered, start=1)
+        if (response.split, response.example_id, response.model_id) not in completed
+    ]
+    progress = track(
+        pending,
+        desc="quality judge",
+        total=len(pending),
+        unit="response",
+    )
+    for index, response in progress:
+        progress.set_postfix(example=response.example_id, model=response.model_id)
         key = (response.split, response.example_id, response.model_id)
-        if key in completed:
-            continue
         try:
             judgment = evaluator.score(
                 response, anonymous_id=f"candidate-{index:06d}"

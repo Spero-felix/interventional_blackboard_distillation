@@ -156,16 +156,13 @@ _CANDIDATE_PROMPT = _prompt(
         "Procedure": "Read the latest seeker turn, apply the assigned strategy, and make the response usable on its own.",
         "Constraints": "Do not introduce another strategy, mention metadata, invent facts, or exceed 30 words in the response.",
         "Quality Criteria": "The response unmistakably realizes its assigned strategy and differs functionally from other candidates.",
-        "Output Contract": "Return ONLY JSON matching the supplied schema and echo candidate_id, strategy_id, strategy, and seed exactly.",
+        "Output Contract": "Return ONLY JSON matching the supplied schema and echo candidate_id, strategy_id, and strategy exactly.",
     },
 )
-for _index in range(1, 4):
-    _ROLE_PROMPTS[f"candidate_{_index}"] = _CANDIDATE_PROMPT
+_ROLE_PROMPTS["candidate"] = _CANDIDATE_PROMPT
 
 PROMPT_ROLES = tuple(_ROLE_PROMPTS)
-_STATE_CLAMP_ROLES = {
-    "planner", "candidate_1", "candidate_2", "candidate_3", "final_selector"
-}
+_STATE_CLAMP_ROLES = {"planner", "candidate", "final_selector"}
 
 
 def _jsonable(value: Any) -> Any:
@@ -180,11 +177,24 @@ def _jsonable(value: Any) -> Any:
 
 def _resolved_prompt(role: str, context: dict[str, Any]) -> str:
     prompt = _ROLE_PROMPTS[role]
-    if role.startswith("candidate_"):
+    if role == "candidate":
         strategy = context.get("strategy")
         if strategy not in ESCONV_STRATEGIES:
             raise ValueError(f"unknown ESConv strategy: {strategy}")
         prompt += f"\n\n# Assigned Strategy\n{strategy}: {ESCONV_STRATEGIES[strategy]}"
+        fixed_plan = context.get("fixed_plan")
+        if fixed_plan is not None:
+            if not isinstance(fixed_plan, dict):
+                raise ValueError("fixed PLAN intervention requires plan fields")
+            required = {"strategies", "response_goal", "response_act"}
+            if not required.issubset(fixed_plan):
+                raise ValueError("fixed PLAN intervention requires complete plan fields")
+            prompt += (
+                "\n\n# Experimental PLAN Clamp\n"
+                "Treat the supplied fixed_plan selected strategy, response goal, and "
+                "response act as authoritative. Use them to write the response and "
+                "must not replan, substitute another goal, or substitute another act."
+            )
     clamped_field = context.get("clamped_state_field")
     if clamped_field is not None and role in _STATE_CLAMP_ROLES:
         state = context.get("state")
@@ -200,10 +210,15 @@ def _resolved_prompt(role: str, context: dict[str, Any]) -> str:
 
 
 def _freeze_candidate_schema(schema: dict[str, Any], context: dict[str, Any]) -> None:
-    for field in ("candidate_id", "strategy_id", "strategy", "seed"):
+    for field in ("candidate_id", "strategy_id", "strategy"):
         property_schema = schema["properties"][field]
         property_schema.pop("enum", None)
         property_schema["const"] = context[field]
+    schema["properties"].pop("seed", None)
+    if "required" in schema:
+        schema["required"] = [
+            field for field in schema["required"] if field != "seed"
+        ]
 
 
 def build_messages(
@@ -220,7 +235,7 @@ def build_messages(
     if normalized_context:
         payload["context"] = normalized_context
     schema = response_model.model_json_schema()
-    if role.startswith("candidate_"):
+    if role == "candidate":
         _freeze_candidate_schema(schema, normalized_context)
     return [
         {

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -17,6 +19,7 @@ from .schemas import (
     History,
     MultiViewStateAnalysis,
     NonSafetyDimension,
+    PlanSelection,
     StateBlackboard,
     StateCounterfactual,
     StrictModel,
@@ -28,11 +31,26 @@ from .schemas import (
 NORMAL_ROLES = (
     "multi_view_state_analyzer",
     "planner",
-    "candidate_1",
-    "candidate_2",
-    "candidate_3",
+    "candidate",
+    "candidate",
+    "candidate",
     "final_selector",
 )
+
+_JSON_FENCE = re.compile(
+    r"```(?:json)?\s*\n?(.*?)\n?```",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _single_fenced_payload(text: str) -> object | None:
+    matches = _JSON_FENCE.findall(text)
+    if len(matches) != 1:
+        return None
+    try:
+        return json.loads(matches[0])
+    except json.JSONDecodeError:
+        return None
 
 
 @dataclass(frozen=True)
@@ -60,9 +78,16 @@ class _PlainTextCandidateBackend:
             payload = json.loads(result.text)
         except json.JSONDecodeError:
             payload = None
+        fenced_payload = _single_fenced_payload(result.text)
+        if fenced_payload is not None:
+            payload = fenced_payload
+            result = LLMResult(
+                text=json.dumps(payload, ensure_ascii=False),
+                usage=result.usage,
+            )
         if isinstance(payload, dict):
             return result
-        if result.text.lstrip().startswith(("{", "[")):
+        if "```" in result.text or result.text.lstrip().startswith(("{", "[")):
             return result
         response = payload if isinstance(payload, str) else result.text
         return LLMResult(
@@ -106,10 +131,11 @@ class TeacherRunner:
         context: dict[str, Any] | None = None,
         seed: int | None = None,
         example_id: str | None = None,
+        cache_variant: str | None = None,
     ):
         caller = self.caller
         if not self.config.for_role(role).provider_json_mode and response_model is Candidate:
-            required = {"candidate_id", "strategy_id", "strategy", "seed"}
+            required = {"candidate_id", "strategy_id", "strategy"}
             if context is None or not required.issubset(context):
                 raise ValueError(f"missing frozen candidate metadata for {role}")
             caller = StructuredCaller(
@@ -125,6 +151,7 @@ class TeacherRunner:
             response_model,
             seed=seed,
             example_id=example_id,
+            cache_variant=cache_variant,
         )
         records.extend(new_records)
         return parsed
@@ -237,34 +264,82 @@ class TeacherRunner:
         local_index: int,
         records: list[CallRecord],
         clamped_state_field: str | None = None,
+        fixed_plan: PlanSelection | None = None,
     ) -> Candidate:
-        seed = self.config.candidate_seeds[local_index - 1]
+        strategy_id = f"S{local_index}"
         context: dict[str, Any] = {
             "state": state,
             "candidate_id": str(local_index),
-            "strategy_id": f"S{local_index}",
+            "strategy_id": strategy_id,
             "strategy": strategy,
-            "seed": seed,
         }
         if clamped_state_field is not None:
             context["clamped_state_field"] = clamped_state_field
+        if fixed_plan is not None:
+            if fixed_plan.strategies[0] != strategy:
+                raise ValueError("fixed plan strategy must match assigned candidate strategy")
+            context["fixed_plan"] = fixed_plan
         generated = self._call(
-            f"candidate_{local_index}",
+            "candidate",
             history,
             Candidate,
             records,
             context=context,
-            seed=seed,
             example_id=example_id,
+            cache_variant=strategy_id,
         )
         return generated.model_copy(
             update={
                 "candidate_id": str(local_index),
-                "strategy_id": f"S{local_index}",
+                "strategy_id": strategy_id,
                 "strategy": strategy,
-                "seed": seed,
+                "seed": None,
             }
         )
+
+    def _selector_candidates(
+        self,
+        candidates: list[Candidate],
+        example_id: str | None,
+    ) -> list[Candidate]:
+        identity = example_id or json.dumps(
+            [candidate.model_dump(mode="json") for candidate in candidates],
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        return sorted(
+            candidates,
+            key=lambda candidate: hashlib.sha256(
+                (
+                    f"{self.config.protocol_version}\0{identity}\0"
+                    f"{candidate.candidate_id}"
+                ).encode("utf-8")
+            ).digest(),
+        )
+
+    def generate_response_under_fixed_plan(
+        self,
+        history: History,
+        state: StateBlackboard,
+        plan: PlanSelection,
+        *,
+        clamped_state_field: str,
+        example_id: str,
+    ) -> str:
+        """Generate one response after changing STATE while holding PLAN fixed."""
+
+        records: list[CallRecord] = []
+        candidate = self._generate_candidate(
+            example_id=example_id,
+            history=history,
+            state=state,
+            strategy=plan.strategies[0],
+            local_index=1,
+            records=records,
+            clamped_state_field=clamped_state_field,
+            fixed_plan=plan,
+        )
+        return candidate.response
 
     def _run_final_selector(
         self,
@@ -276,7 +351,10 @@ class TeacherRunner:
         example_id: str | None,
         clamped_state_field: str | None = None,
     ) -> FinalSelection:
-        context: dict[str, Any] = {"state": state, "candidates": candidates}
+        context: dict[str, Any] = {
+            "state": state,
+            "candidates": self._selector_candidates(candidates, example_id),
+        }
         if clamped_state_field is not None:
             context["clamped_state_field"] = clamped_state_field
         decision = self._call(

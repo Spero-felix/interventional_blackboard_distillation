@@ -15,6 +15,7 @@ QUALITY_COMMANDS = {
     "quality-judge",
     "quality-human-export",
     "quality-human-summarize",
+    "quality-merge",
 }
 
 
@@ -44,6 +45,11 @@ def register_quality_commands(commands: argparse._SubParsersAction) -> None:
     human_summary.add_argument("--mapping", required=True)
     human_summary.add_argument("--output", required=True)
 
+    merge = commands.add_parser("quality-merge")
+    merge.add_argument("--base-dir", required=True)
+    merge.add_argument("--standalone-dir", required=True)
+    merge.add_argument("--output-dir", required=True)
+
 
 def _models(path: str | Path, model_type):
     return [model_type.model_validate(row) for row in read_jsonl(path)]
@@ -56,6 +62,12 @@ def run_quality_command(args: argparse.Namespace) -> int:
         report = summarize_human_annotations(args.annotations, args.mapping)
         atomic_write_json(args.output, report)
         print(f"wrote {args.output}")
+        return 0
+    if args.command == "quality-merge":
+        from .quality_merge import merge_quality_judgments
+
+        merge_quality_judgments(args.base_dir, args.standalone_dir, args.output_dir)
+        print(f"wrote {Path(args.output_dir) / 'ranking.json'}")
         return 0
 
     config = QualityEvalConfig.from_yaml(args.config)

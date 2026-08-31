@@ -123,7 +123,7 @@ class Candidate(StrictModel):
     strategy_id: StrategyId
     strategy: StrategyName
     response: str = Field(min_length=1)
-    seed: int
+    seed: int | None = None
     response_goal: str = Field(min_length=1)
     response_act: str = Field(min_length=1)
 
@@ -248,6 +248,9 @@ class InterventionRecord(StrictModel):
     counterfactual_response: str = Field(min_length=1)
     target_dimension: NonSafetyDimension
     affected_dimensions: list[NonSafetyDimension] = Field(default_factory=list)
+    conditioning_contract: Literal[
+        "legacy_joint_downstream_v1", "single_variable_v1"
+    ] = "legacy_joint_downstream_v1"
     localized_effect: bool = True
     conditional_correspondence_verified: bool = True
     bidirectional_verified: bool

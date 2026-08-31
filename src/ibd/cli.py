@@ -9,7 +9,7 @@ from typing import Any, Sequence
 
 from .backend import OpenAIBackend
 from .config import AppConfig
-from .export import intervention_row, sft_row, slot_row
+from .export import intervention_row, sft_row, slot_row, visible_sft_row
 from .progress import track
 from .schemas import (
     History,
@@ -17,7 +17,7 @@ from .schemas import (
     STATE_ANCHOR_FIELDS,
     TeacherTrace,
 )
-from .storage import read_jsonl, write_jsonl
+from .storage import append_jsonl, read_jsonl, write_jsonl
 from .teacher import TeacherRunner
 
 
@@ -29,7 +29,10 @@ def _load_records(path: str | Path) -> list[dict[str, Any]]:
     if isinstance(payload, list):
         return payload
     if isinstance(payload, dict):
-        if payload.get("protocol_version") == "socialsim-qwen-conversation-v1":
+        if payload.get("protocol_version") in {
+            "socialsim-qwen-conversation-v1",
+            "socialsim-qwen-conversation-v2",
+        }:
             from .socialsim import PreparedSocialSim
 
             prepared = PreparedSocialSim.model_validate(payload)
@@ -53,9 +56,16 @@ def _build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--config", required=True)
     run_parser.add_argument("--input", required=True)
     run_parser.add_argument("--output", required=True)
+    run_parser.add_argument("--resume", action="store_true")
+    run_parser.add_argument("--continue-on-error", action="store_true")
+    run_parser.add_argument("--failures")
 
     export_parser = commands.add_parser("export-student")
-    export_parser.add_argument("--kind", choices=("sft", "slot", "intervention"), required=True)
+    export_parser.add_argument(
+        "--kind",
+        choices=("sft", "slot", "visible-sft", "intervention"),
+        required=True,
+    )
     export_parser.add_argument("--input", required=True)
     export_parser.add_argument("--output", required=True)
 
@@ -74,6 +84,8 @@ def _build_parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--train-size", type=int, default=96)
     prepare_parser.add_argument("--dev-size", type=int, default=16)
     prepare_parser.add_argument("--holdout-size", type=int, default=16)
+    prepare_parser.add_argument("--early-fraction", type=float, default=0.1)
+    prepare_parser.add_argument("--late-fraction", type=float, default=0.1)
 
     intervention_parser = commands.add_parser("build-interventions")
     intervention_parser.add_argument("--config", required=True)
@@ -81,6 +93,11 @@ def _build_parser() -> argparse.ArgumentParser:
     intervention_parser.add_argument("--output", required=True)
     intervention_parser.add_argument("--manifest", required=True)
     intervention_parser.add_argument("--global-seed", type=int, required=True)
+    intervention_parser.add_argument(
+        "--state-plan-policy",
+        choices=("rerun", "fixed-original"),
+        default="rerun",
+    )
 
     anchor_parser = commands.add_parser("precompute-anchors")
     anchor_parser.add_argument("--config", required=True)
@@ -114,11 +131,22 @@ def _build_parser() -> argparse.ArgumentParser:
         command_parser.add_argument("--device", type=int, default=0)
 
     train_parser = commands.add_parser("train")
-    train_parser.add_argument("--stage", choices=("A", "B", "C"), required=True)
+    train_parser.add_argument("--stage", choices=("A", "B", "B2", "C"), required=True)
     add_training_arguments(train_parser)
 
     pipeline_parser = commands.add_parser("train-pipeline")
     add_training_arguments(pipeline_parser)
+
+    control_parser = commands.add_parser("train-sft-control")
+    control_parser.add_argument("--config", required=True)
+    control_parser.add_argument("--run-name", required=True)
+    control_parser.add_argument("--seed", type=int, required=True)
+    control_input = control_parser.add_mutually_exclusive_group(required=True)
+    control_input.add_argument("--traces")
+    control_input.add_argument("--dataset")
+    control_parser.add_argument("--run-dir", default="runs")
+    control_parser.add_argument("--resume")
+    control_parser.add_argument("--device", type=int, default=0)
 
     evaluate_parser = commands.add_parser("evaluate")
     evaluate_parser.add_argument("--config", required=True)
@@ -168,6 +196,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "dev": args.dev_size,
                 "diagnostic_holdout": args.holdout_size,
             },
+            early_fraction=args.early_fraction,
+            late_fraction=args.late_fraction,
         )
         target = Path(args.output)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -188,6 +218,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "precompute-anchors",
         "train",
         "train-pipeline",
+        "train-sft-control",
         "evaluate",
         "generate",
     }:
@@ -208,26 +239,66 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "run-teacher":
+        output_path = Path(args.output)
+        if args.continue_on_error and args.failures is None:
+            raise ValueError("--continue-on-error requires --failures")
+        if output_path.exists() and not args.resume:
+            raise FileExistsError(
+                f"output already exists: {output_path}; pass --resume to continue"
+            )
+
+        completed_ids: set[str] = set()
+        if args.resume:
+            if not output_path.is_file():
+                raise FileNotFoundError(
+                    f"cannot resume because output does not exist: {output_path}"
+                )
+            for stored_trace in read_jsonl(output_path):
+                trace = TeacherTrace.model_validate(stored_trace)
+                completed_ids.add(trace.example_id)
+
         config = AppConfig.from_yaml(args.config)
         runner = TeacherRunner(OpenAIBackend(config), config)
-        traces = []
+        pending_records = [
+            record
+            for record in records
+            if str(record["example_id"]) not in completed_ids
+        ]
+        written = 0
+        failures = 0
         progress = track(
-            records,
+            pending_records,
             desc="teacher examples",
-            total=len(records),
+            total=len(pending_records),
             unit="example",
         )
         for record in progress:
             progress.set_postfix(example=str(record["example_id"]))
-            traces.append(
-                runner.run(
+            try:
+                trace = runner.run(
                     str(record["example_id"]),
                     History.model_validate(record["history"]),
                     split=record.get("split", "train"),
                 )
-            )
-        write_jsonl(args.output, traces)
-        print(f"wrote {len(traces)}")
+            except Exception as exc:
+                if not args.continue_on_error:
+                    raise
+                failure = {
+                    "example_id": str(record["example_id"]),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+                if "split" in record:
+                    failure["split"] = record["split"]
+                append_jsonl(args.failures, failure)
+                failures += 1
+                continue
+            append_jsonl(output_path, trace)
+            written += 1
+        print(f"wrote {written}")
+        if failures:
+            print(f"failed {failures}; see {args.failures}")
+            return 1
         return 0
 
     rows: list[dict[str, Any]] = []
@@ -241,6 +312,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             rows.append(sft_row(TeacherTrace.model_validate(record)))
         elif args.kind == "slot":
             rows.append(slot_row(TeacherTrace.model_validate(record)))
+        elif args.kind == "visible-sft":
+            rows.append(visible_sft_row(TeacherTrace.model_validate(record)))
         else:
             prompt = str(record["prompt"])
             payload = {key: value for key, value in record.items() if key != "prompt"}

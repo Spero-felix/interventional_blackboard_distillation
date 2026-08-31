@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from .schemas import InterventionRecord, TeacherTrace
+from .visible_sft import serialize_visible_sft
 
 
 def _ensure_trainable(trace: TeacherTrace) -> None:
@@ -29,6 +30,18 @@ def slot_row(trace: TeacherTrace) -> dict[str, Any]:
         "prompt": trace.history.as_prompt(),
         "state": trace.state.model_dump(mode="json"),
         "plan": trace.final_selection.to_plan_selection().model_dump(mode="json"),
+    }
+
+
+def visible_sft_row(trace: TeacherTrace) -> dict[str, Any]:
+    """Export a static visible STATE/strategy target for ordinary SFT."""
+
+    _ensure_trainable(trace)
+    return {
+        "example_id": trace.example_id,
+        "split": trace.split,
+        "history": trace.history.model_dump(mode="json"),
+        "response": serialize_visible_sft(trace),
     }
 
 

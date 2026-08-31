@@ -53,7 +53,6 @@ class AppConfig(BaseModel):
     backend: BackendConfig = Field(default_factory=BackendConfig)
     default_model: ModelConfig
     roles: dict[str, ModelConfig] = Field(default_factory=dict)
-    candidate_seeds: tuple[int, int, int] = (11, 29, 47)
     schema_retries: int = Field(default=1, ge=0, le=1)
 
     @classmethod

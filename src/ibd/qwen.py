@@ -26,6 +26,28 @@ LORA_TARGETS = (
 )
 
 
+class StageEpochs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    A: int = Field(default=1, ge=0)
+    B: int = Field(default=1, ge=0)
+    B2: int = Field(default=0, ge=0)
+    C: int = Field(default=1, ge=0)
+
+    def for_stage(self, stage: Literal["A", "B", "B2", "C"]) -> int:
+        return getattr(self, stage)
+
+
+class B2LossConfig(BaseModel):
+    """Weights for the anchor-conditioned B2 objective."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    natural_weight: float = Field(default=1.0, ge=0.0)
+    conditioned_weight: float = Field(default=1.0, ge=0.0)
+    alignment_weight: float = Field(default=0.1, ge=0.0)
+
+
 class QwenTrainingConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -51,7 +73,16 @@ class QwenTrainingConfig(BaseModel):
     plan_weight: float = Field(default=1.0, ge=0.0)
     margin: float = Field(default=0.5, ge=0.0)
     replay_weight: float = Field(default=0.1, ge=0.0)
+    b2: B2LossConfig = Field(default_factory=B2LossConfig)
     max_optimizer_steps_per_stage: int | None = Field(default=None, gt=0)
+    epochs: StageEpochs = Field(default_factory=StageEpochs)
+    scheduler_type: Literal["constant", "cosine"] = "constant"
+    scheduler_total_steps: int | None = Field(default=None, gt=0)
+    warmup_ratio: float = Field(default=0.0, ge=0.0, lt=1.0)
+    max_grad_norm: float = Field(default=1.0, gt=0.0)
+    evaluate_dev: bool = True
+    early_stopping_patience: int | None = Field(default=None, ge=0)
+    save_every_epoch: Literal[True] = True
 
     @model_validator(mode="after")
     def validate_frozen_protocol(self) -> "QwenTrainingConfig":
@@ -65,12 +96,26 @@ class QwenTrainingConfig(BaseModel):
             raise ValueError("3090 functional-pair protocol requires micro_batch_size=1")
         if self.slot_layer != 13:
             raise ValueError("production slot_layer must be 13")
+        if all(
+            self.epochs.for_stage(stage) == 0 for stage in ("A", "B", "B2", "C")
+        ):
+            raise ValueError("at least one training stage must have positive epochs")
         return self
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "QwenTrainingConfig":
         payload = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
         return cls.model_validate(payload)
+
+
+class StandardSFTControlConfig(QwenTrainingConfig):
+    """Ordinary SFT control matched to the B-8e-5 optimization protocol."""
+
+    learning_rate: float = Field(default=8e-5, gt=0.0)
+    sft_epochs: int = Field(default=4, gt=0)
+    scheduler_total_steps: int = Field(default=1880, gt=0)
+    scheduler_type: Literal["constant", "cosine"] = "cosine"
+    warmup_ratio: float = Field(default=0.03, ge=0.0, lt=1.0)
 
 @dataclass(frozen=True)
 class LoadedQwen:
@@ -96,6 +141,17 @@ class FrozenQwen:
 class BaseQwen:
     tokenizer: Any
     model: torch.nn.Module
+
+
+@dataclass(frozen=True)
+class StandardSFTQwen:
+    tokenizer: Any
+    model: torch.nn.Module
+    trainable_parameters: int
+    total_parameters: int
+    lora_parameters: int
+    token_row_parameters: int
+    unexpected_trainables: list[str]
 
 
 def validate_local_qwen_directory(path: str | Path) -> dict[str, Any]:
@@ -279,6 +335,93 @@ def load_qwen_qlora(
     )
 
 
+def load_qwen_standard_sft(
+    config: QwenTrainingConfig | StandardSFTControlConfig,
+    *,
+    device: int = 0,
+    tokenizer_loader: Callable[..., Any] | None = None,
+    model_loader: Callable[..., torch.nn.Module] | None = None,
+    quantization_config_factory: Callable[..., Any] | None = None,
+    prepare_model_fn: Callable[..., torch.nn.Module] | None = None,
+    peft_model_factory: Callable[..., torch.nn.Module] | None = None,
+) -> StandardSFTQwen:
+    """Load ordinary QLoRA SFT without IBD tokens, slots, or token-row tuning."""
+    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+    tokenizer_loader = tokenizer_loader or AutoTokenizer.from_pretrained
+    model_loader = model_loader or AutoModelForCausalLM.from_pretrained
+    quantization_config_factory = quantization_config_factory or BitsAndBytesConfig
+    prepare_model_fn = prepare_model_fn or prepare_model_for_kbit_training
+    peft_model_factory = peft_model_factory or get_peft_model
+
+    model_path = str(config.model_path)
+    tokenizer = tokenizer_loader(
+        model_path,
+        local_files_only=True,
+        trust_remote_code=False,
+    )
+    if getattr(tokenizer, "pad_token_id", None) is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    compute_dtype = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+    }[config.bnb_4bit_compute_dtype]
+    quantization_config = quantization_config_factory(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=compute_dtype,
+    )
+    model = model_loader(
+        model_path,
+        local_files_only=True,
+        trust_remote_code=False,
+        quantization_config=quantization_config,
+        device_map={"": device},
+        torch_dtype=compute_dtype,
+    )
+    _validate_loaded_architecture(model)
+    model.config.use_cache = False
+    checkpointing_kwargs = {"use_reentrant": False}
+    if config.gradient_checkpointing:
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs=checkpointing_kwargs
+        )
+    model = prepare_model_fn(
+        model,
+        use_gradient_checkpointing=config.gradient_checkpointing,
+        gradient_checkpointing_kwargs=checkpointing_kwargs,
+    )
+    model = peft_model_factory(
+        model,
+        LoraConfig(
+            task_type="CAUSAL_LM",
+            r=config.lora_r,
+            lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout,
+            target_modules=list(config.lora_targets),
+            bias="none",
+        ),
+    )
+    trainable, total, lora, token_rows, unexpected = _parameter_accounting(model)
+    if not trainable:
+        raise ValueError("QLoRA model has no trainable parameters")
+    if unexpected:
+        raise ValueError(f"unexpected trainable parameters: {unexpected}")
+    if token_rows:
+        raise ValueError("standard SFT must not train token embedding rows")
+    return StandardSFTQwen(
+        tokenizer=tokenizer,
+        model=model,
+        trainable_parameters=trainable,
+        total_parameters=total,
+        lora_parameters=lora,
+        token_row_parameters=token_rows,
+        unexpected_trainables=unexpected,
+    )
+
+
 def load_frozen_qwen_for_anchors(
     config: QwenTrainingConfig,
     *,
@@ -378,4 +521,40 @@ def restore_qwen_for_inference(
         restore_rng=False,
     )
     loaded.slot_model.eval()
+    return loaded
+
+
+def restore_qwen_standard_sft_for_inference(
+    config: StandardSFTControlConfig,
+    *,
+    checkpoint: str | Path,
+    run_name: str,
+    device: int = 0,
+) -> StandardSFTQwen:
+    """Load a standard-SFT control checkpoint without constructing IBD slots."""
+    from .checkpointing import CheckpointManager, CheckpointMetadata
+
+    loaded = load_qwen_standard_sft(config, device=device)
+    validate_local_qwen_directory(config.model_path)
+    checkpoint_path = Path(checkpoint)
+    payload = json.loads(
+        (checkpoint_path / "checkpoint.json").read_text(encoding="utf-8")
+    )
+    metadata = CheckpointMetadata.model_validate(payload["metadata"])
+    if metadata.stage != "SFT" or metadata.checkpoint_version != "qwen-standard-sft-control-v1":
+        raise ValueError("checkpoint is not a standard SFT control checkpoint")
+    manager = CheckpointManager(
+        checkpoint_path.parent,
+        run_name=run_name,
+        seed=metadata.seed,
+    )
+    manager.load(
+        checkpoint_path,
+        target_stage="SFT",
+        model=loaded.model,
+        expected={"slot_layer": None, "special_token_ids": None},
+        restore_rng=False,
+    )
+    loaded.model.config.use_cache = True
+    loaded.model.eval()
     return loaded

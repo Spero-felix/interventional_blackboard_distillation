@@ -19,7 +19,7 @@ micro_batch_size: 1
 gradient_accumulation_steps: 8
 gradient_checkpointing: true
 optimizer: paged_adamw_8bit
-learning_rate: 0.0002
+learning_rate: 0.0001
 slot_layer: 13
 anchor_temperature: 0.07
 cosine_weight: 1.0
@@ -27,4 +27,13 @@ state_weight: 1.0
 plan_weight: 1.0
 margin: 0.5
 replay_weight: 0.1
-max_optimizer_steps_per_stage: 1
+epochs:
+  A: 5
+  B: 5
+  C: 0
+scheduler_type: cosine
+warmup_ratio: 0.03
+max_grad_norm: 1.0
+evaluate_dev: true
+early_stopping_patience: 2
+save_every_epoch: true
