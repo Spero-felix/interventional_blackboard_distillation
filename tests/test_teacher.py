@@ -6,7 +6,7 @@ from conftest import ScriptedBackend
 from ibd.backend import LLMResult
 from ibd.config import ModelConfig
 from ibd.prompting import PROMPT_ROLES, build_messages
-from ibd.schemas import Candidate, FinalSelectionDecision
+from ibd.schemas import Candidate, FinalSelectionDecision, StrategyPlanSet
 from ibd.teacher import NORMAL_ROLES, TeacherRunner, _PlainTextCandidateBackend
 
 
@@ -98,6 +98,41 @@ def test_candidate_prompt_contains_only_its_assigned_strategy(history):
     assert '"seed"' not in prompt
 
 
+def test_planner_prompt_limits_others_to_dialogue_management(history):
+    prompt = build_messages(
+        "planner",
+        history,
+        StrategyPlanSet,
+        context={"state": {}},
+    )[0]["content"]
+
+    assert "Others (Dialogue Management and Social Courtesy)" in prompt
+    assert "manage the conversational interaction itself" in prompt
+    assert "greetings, brief social acknowledgments, responses to gratitude" in prompt
+    assert "Never use Others as a fallback or merely to fill three strategy slots." in prompt
+
+
+def test_others_candidate_prompt_uses_only_the_positive_assigned_definition(history):
+    prompt = build_messages(
+        "candidate",
+        history,
+        Candidate,
+        context={
+            "state": {},
+            "candidate_id": "1",
+            "strategy_id": "S1",
+            "strategy": "Others",
+        },
+    )[0]["content"]
+
+    assert "# Assigned Strategy" in prompt
+    assert "Others (Dialogue Management and Social Courtesy)" in prompt
+    assert "manage the conversational interaction itself" in prompt
+    assert "seeker's situation, emotions, beliefs, decisions, or actions" in prompt
+    assert '"const": "Others"' in prompt
+    assert "Providing Suggestions:" not in prompt
+
+
 def test_final_selector_schema_cannot_contain_rewritten_response(history):
     prompt = build_messages(
         "final_selector",
@@ -127,6 +162,20 @@ def test_final_selector_prompt_uses_ordered_response_quality_policy(history):
     assert "concrete, autonomy-preserving response" in prompt
     assert "Do not favor a candidate because of its ID, order, or strategy name." in prompt
     assert "must accurately describe the selected response" in prompt
+
+
+def test_final_selector_prompt_gates_others_by_primary_function(history):
+    prompt = build_messages(
+        "final_selector",
+        history,
+        FinalSelectionDecision,
+        context={"state": {}, "candidates": []},
+    )[0]["content"]
+
+    assert "Others (Dialogue Management and Social Courtesy)" in prompt
+    assert "Select Others only when" in prompt
+    assert "latest seeker turn" in prompt
+    assert "that more specific strategy takes precedence over Others" in prompt
 
 
 def test_selector_response_is_taken_verbatim_from_candidate(history, app_config):

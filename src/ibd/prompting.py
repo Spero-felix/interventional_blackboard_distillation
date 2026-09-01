@@ -9,6 +9,8 @@ from pydantic import BaseModel
 
 from .schemas import History
 
+OTHERS_DISPLAY_NAME = "Others (Dialogue Management and Social Courtesy)"
+
 ESCONV_STRATEGIES = {
     "Question": "Ask one focused question that helps clarify a feeling, need, preference, or next step.",
     "Restatement or Paraphrasing": "Restate the seeker's meaning accurately without adding interpretation.",
@@ -17,7 +19,18 @@ ESCONV_STRATEGIES = {
     "Affirmation and Reassurance": "Validate understandable reactions or strengths with grounded reassurance.",
     "Providing Suggestions": "Offer practical options as choices that preserve autonomy and match readiness.",
     "Information": "Provide relevant factual or explanatory information without unsupported certainty.",
-    "Others": "Use a supportive act that does not fit the seven named categories.",
+    "Others": (
+        "Use this strategy only when the primary function of the response is to "
+        "manage the conversational interaction itself rather than to address the "
+        "seeker's situation, emotions, beliefs, decisions, or actions. This includes "
+        "greetings, brief social acknowledgments, responses to gratitude, "
+        "conversational pacing or transitions, and appropriate closing or farewell "
+        "messages. Do not select Others if the response primarily asks for information, "
+        "restates the seeker's meaning, reflects the seeker's feelings, shares personal "
+        "experience, provides affirmation or reassurance, offers factual information, "
+        "or gives suggestions. When another strategy clearly describes the primary "
+        "response act, that more specific strategy takes precedence over Others."
+    ),
 }
 
 _SECTIONS = (
@@ -177,11 +190,34 @@ def _jsonable(value: Any) -> Any:
 
 def _resolved_prompt(role: str, context: dict[str, Any]) -> str:
     prompt = _ROLE_PROMPTS[role]
+    if role == "planner":
+        prompt += (
+            "\n\n# Others Strategy Boundary\n"
+            f"{OTHERS_DISPLAY_NAME}: {ESCONV_STRATEGIES['Others']}\n"
+            "Include Others only when the latest seeker turn primarily calls for "
+            "greeting, brief social acknowledgment, a response to gratitude, "
+            "conversational pacing or transition, or closing or farewell. "
+            "Never use Others as a fallback or merely to fill three strategy slots."
+        )
+    elif role == "final_selector":
+        prompt += (
+            "\n\n# Others Strategy Boundary\n"
+            f"{OTHERS_DISPLAY_NAME}: {ESCONV_STRATEGIES['Others']}\n"
+            "Select Others only when the actual response's primary function and the "
+            "latest seeker turn call for managing the interaction itself. When another "
+            "candidate clearly realizes a named substantive support strategy that fits "
+            "the seeker's current need, that more specific strategy takes precedence "
+            "over Others."
+        )
     if role == "candidate":
         strategy = context.get("strategy")
         if strategy not in ESCONV_STRATEGIES:
             raise ValueError(f"unknown ESConv strategy: {strategy}")
-        prompt += f"\n\n# Assigned Strategy\n{strategy}: {ESCONV_STRATEGIES[strategy]}"
+        display_name = OTHERS_DISPLAY_NAME if strategy == "Others" else strategy
+        prompt += (
+            f"\n\n# Assigned Strategy\n"
+            f"{display_name}: {ESCONV_STRATEGIES[strategy]}"
+        )
         fixed_plan = context.get("fixed_plan")
         if fixed_plan is not None:
             if not isinstance(fixed_plan, dict):
