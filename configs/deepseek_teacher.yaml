@@ -1,4 +1,4 @@
-protocol_version: qwen25-socialsim-single-strategy-v4
+protocol_version: qwen25-socialsim-single-strategy-v5-others-dialogue-management
 
 backend:
   base_url_env: OPENAI_BASE_URL
