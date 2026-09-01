@@ -108,7 +108,9 @@ $PY -m ibd.cli run-teacher \
   --input artifacts/socialsim/prepared.json \
   --output artifacts/teacher/traces.jsonl
 
-# policy-neutral-v1 使用新的缓存命名空间和数据契约。Teacher trace、
+# policy-neutral-v2-synthetic-self-disclosure 使用新的缓存命名空间和数据契约。
+# Self-disclosure 允许简短、通用、低风险的合成支持者经历，但禁止虚构资质、
+# 诊疗经历、高风险事件或可核验的详细人生经历。Teacher trace、
 # intervention 与 anchor 必须写入新的 artifact 目录，不能与旧协议混用。
 
 $PY -m ibd.cli build-interventions \

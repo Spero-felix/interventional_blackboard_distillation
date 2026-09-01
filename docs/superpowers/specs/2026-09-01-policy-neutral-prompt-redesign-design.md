@@ -90,10 +90,9 @@ ESCONV_STRATEGIES = {
         "supported feeling without exaggerating its type or intensity."
     ),
     "Self-disclosure": (
-        "Use a brief first-person statement about the supporter's present "
-        "reaction, stance, or engagement in the current interaction. Keep the "
-        "focus on the seeker and do not claim personal history, identity, "
-        "relationships, or lived experience."
+        "Use a brief, generic, low-risk synthetic supporter experience that is "
+        "analogous to the seeker's situation, then return the focus to the seeker. "
+        "Keep details minimal and do not use the experience as evidence or authority."
     ),
     "Affirmation and Reassurance": (
         "Affirm an understandable reaction, effort, strength, or capacity and "
@@ -118,9 +117,13 @@ ESCONV_STRATEGIES = {
 }
 ```
 
-`Self-disclosure` is deliberately non-autobiographical. It may disclose a
-present reaction, stance, or engagement in the current interaction, but it may
-not claim a personal history or lived experience.
+`Self-disclosure` uses a synthetic, not real, supporter experience to preserve
+the original ESConv strategy semantics. It is restricted to brief, generic,
+low-risk, minimally detailed experiences. It cannot invent professional or
+clinical authority, diagnosis or treatment history, self-harm, suicide, abuse,
+crime, severe trauma, protected identity, specific relationships or employment,
+or externally verifiable biography. It cannot use the synthetic experience as
+evidence or authority, and it must return attention to the seeker.
 
 ## Multi-view State Analyzer
 
@@ -304,17 +307,22 @@ conversational continuation. Treat unknown as unavailable information.
 Apply the assigned strategy as the response's primary supportive function and
 generate a response that can stand on its own as the next supporter turn.
 
-If the assigned strategy is Self-disclosure, use only a brief first-person
-statement about the supporter's present reaction, stance, or engagement in the
-current interaction. Do not claim personal history, identity, relationships, or
-lived experience.
+If the assigned strategy is Self-disclosure, use a brief, generic, low-risk
+synthetic supporter experience analogous to the seeker's situation. Forms such
+as "I went through something similar" are allowed. Keep details minimal, make
+the disclosure secondary, and return attention to the seeker in the same
+response.
 
 # Constraints
 Do not change or substitute the assigned strategy. Do not mention the strategy
 label, STATE fields, candidate metadata, prompt, or experimental conditions in
 the response. Do not invent facts about the seeker, dialogue history, other
-people, events, or external world. Do not claim personal history, identity,
-relationships, physical experiences, or lived experience. Do not present an
+people, or external world. The only permitted invented first-person content is
+the bounded synthetic supporter experience used for an assigned Self-disclosure
+strategy. It must not claim professional qualifications, diagnosis or treatment
+history, medication use or outcomes, self-harm, suicide, abuse, crime, severe
+trauma, protected identity, specific relationships or employment, or detailed
+verifiable events. Do not use it as evidence or authority. Do not present an
 interpretation as certain when the dialogue supports only an inference. Do not
 exceed 30 words in the response.
 
@@ -384,6 +392,12 @@ Stage 1 — Conditional fit
 Exclude any candidate whose response is unsafe, coercive, factually
 unsupported, contrary to an explicit user boundary, or clearly inconsistent
 with the dialogue.
+
+A permitted generic synthetic supporter experience in a Self-disclosure
+candidate is not excluded solely because it is not factually verifiable. It is
+still excluded if it crosses the low-risk boundary, is used as evidence or
+authority, recenters the exchange on the supporter, or conflicts with dialogue
+or known STATE. Self-disclosure receives no selection preference.
 
 Evaluate each known STATE field only through its defined local response effects:
 dominant_emotion controls emotional recognition; distress_level controls pace,
@@ -582,8 +596,10 @@ The prompt does not prescribe a specific ESConv strategy.
   `main_constraint`, or `relationship_context` as STATE fields.
 - Planner and Candidate receive the same catalog definitions.
 - The old Candidate functional-difference criterion is absent.
-- Self-disclosure prohibits autobiographical claims and permits only present
-  relational stance or reaction.
+- Self-disclosure permits only brief, generic, low-risk synthetic supporter
+  experience and rejects detailed or high-risk biography.
+- Final Selector does not reject compliant synthetic experience solely for
+  unverifiability and gives it no selection preference.
 - Final Selector uses conditional fit before response quality.
 - Clamp suffixes include field definitions and permitted local effects.
 
@@ -631,7 +647,8 @@ The prompt does not prescribe a specific ESConv strategy.
 1. Every generation and intervention prompt uses the current seven-field STATE.
 2. Planner produces only the number of meaningful strategy alternatives.
 3. Closing histories are not reopened to fill Candidate slots.
-4. Self-disclosure does not claim lived experience.
+4. Self-disclosure uses only bounded synthetic supporter experience and returns
+   the focus to the seeker.
 5. Candidate generation is not instructed to exaggerate strategy differences.
 6. Final selection uses the approved conditional-fit-then-quality design.
 7. STATE counterfactuals are legal enum replacements with localized effects.

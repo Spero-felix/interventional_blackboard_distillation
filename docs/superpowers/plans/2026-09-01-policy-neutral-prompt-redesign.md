@@ -16,7 +16,8 @@
 - STATE meanings and enum values come from `docs/superpowers/specs/2026-08-31-seven-dimensional-user-state-design.md`.
 - Prompt wording and behavior come from `docs/superpowers/specs/2026-09-01-policy-neutral-prompt-redesign-design.md`.
 - Planner returns one to three distinct strategies; it returns only `Others` for an unambiguously closing turn with no unfinished request.
-- Candidate Self-disclosure cannot claim personal history or lived experience.
+- Candidate Self-disclosure may use only brief, generic, low-risk synthetic
+  supporter experience and must return the focus to the seeker.
 - Final Selector uses conditional fit before response quality.
 - Candidate plain text triggers one schema retry; second-attempt plain text receives the approved generic metadata and an audit flag.
 - `unknown`, `<MASKED>`, and the original value are never legal STATE counterfactual replacements.
@@ -177,11 +178,13 @@ def test_planner_prompt_allows_only_meaningful_one_to_three_options(history):
         assert f"{strategy}:" in prompt
 
 
-def test_candidate_prompt_has_natural_fidelity_criterion(history):
+def test_candidate_prompt_has_bounded_synthetic_self_disclosure(history):
     prompt = candidate_prompt(history, strategy="Self-disclosure")
     assert "natural, contextually appropriate" in prompt
     assert "functionally from other candidates" not in prompt
-    assert "present reaction, stance, or engagement" in prompt
+    assert "brief, generic, low-risk synthetic supporter experience" in prompt
+    assert "I went through something similar" in prompt
+    assert "professional qualifications" in prompt
 
 
 def test_final_selector_uses_conditional_fit_then_quality(history):
@@ -556,10 +559,13 @@ git commit -m "feat: unify student support system prompt"
 - [ ] **Step 1: Add protocol and stale-documentation assertions**
 
 ```python
-def test_teacher_configs_use_policy_neutral_protocol():
+def test_teacher_configs_use_synthetic_self_disclosure_protocol():
     for path in TEACHER_CONFIGS:
         config = AppConfig.from_yaml(path)
-        assert config.protocol_version == "qwen25-socialsim-seven-state-policy-neutral-v1"
+        assert config.protocol_version == (
+            "qwen25-socialsim-seven-state-policy-neutral-"
+            "v2-synthetic-self-disclosure"
+        )
 ```
 
 Add an exact-string documentation test or repository check that rejects old diagnostic field examples such as `--diagnostic-state-field readiness`.
@@ -575,7 +581,7 @@ Expected: any remaining failures identify stale old-field fixtures, fixed-three 
 Set both Teacher configs to:
 
 ```yaml
-protocol_version: qwen25-socialsim-seven-state-policy-neutral-v1
+protocol_version: qwen25-socialsim-seven-state-policy-neutral-v2-synthetic-self-disclosure
 ```
 
 Update README architecture from fixed three Candidates to one to three, replace old STATE field examples and visible-SFT marker order, document one-Candidate PLAN-intervention exclusion, and state that new Teacher/intervention/anchor artifacts must be generated in a new directory.

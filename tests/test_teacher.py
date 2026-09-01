@@ -158,7 +158,7 @@ def test_final_selector_schema_cannot_contain_rewritten_response(history):
     }
 
 
-def test_candidate_prompt_has_natural_fidelity_criterion(history):
+def test_self_disclosure_allows_only_low_risk_synthetic_experience(history):
     prompt = build_messages(
         "candidate",
         history,
@@ -173,7 +173,27 @@ def test_candidate_prompt_has_natural_fidelity_criterion(history):
 
     assert "natural, contextually appropriate" in prompt
     assert "differs functionally from other candidates" not in prompt
-    assert "present reaction, stance, or engagement" in prompt
+    assert "brief, generic, low-risk synthetic supporter experience" in prompt
+    assert "I went through something similar" in prompt
+    assert "professional qualifications" in prompt
+    assert "self-harm, suicide, abuse, crime, or severe trauma" in prompt
+    assert "Do not invent facts about the seeker" in prompt
+    assert "Do not claim personal history" not in prompt
+
+
+def test_selector_does_not_treat_compliant_synthetic_disclosure_as_unsupported(
+    history,
+):
+    prompt = build_messages(
+        "final_selector",
+        history,
+        FinalSelectionDecision,
+        context={"state": VALID_STATE, "candidates": []},
+    )[0]["content"]
+
+    assert "permitted generic synthetic supporter experience" in prompt
+    assert "solely because it is not factually verifiable" in prompt
+    assert "does not receive preference" in prompt
 
 
 def test_final_selector_uses_conditional_fit_then_quality(history):
@@ -280,7 +300,7 @@ def test_prompt_registry_contains_only_current_roles():
     }
 
 
-def test_teacher_configs_use_policy_neutral_protocol():
+def test_teacher_configs_use_synthetic_self_disclosure_protocol():
     from ibd.config import AppConfig
 
     repository = Path(__file__).parents[1]
@@ -291,7 +311,7 @@ def test_teacher_configs_use_policy_neutral_protocol():
         config = AppConfig.from_yaml(repository / relative_path)
         assert (
             config.protocol_version
-            == "qwen25-socialsim-seven-state-policy-neutral-v1"
+            == "qwen25-socialsim-seven-state-policy-neutral-v2-synthetic-self-disclosure"
         )
 
 

@@ -24,10 +24,9 @@ ESCONV_STRATEGIES = {
         "supported feeling without exaggerating its type or intensity."
     ),
     "Self-disclosure": (
-        "Use a brief first-person statement about the supporter's present "
-        "reaction, stance, or engagement in the current interaction. Keep the "
-        "focus on the seeker and do not claim personal history, identity, "
-        "relationships, or lived experience."
+        "Use a brief, generic, low-risk synthetic supporter experience that is "
+        "analogous to the seeker's situation, then return the focus to the seeker. "
+        "Keep details minimal and do not use the experience as evidence or authority."
     ),
     "Affirmation and Reassurance": (
         "Affirm an understandable reaction, effort, strength, or capacity and "
@@ -192,7 +191,14 @@ _ROLE_PROMPTS = {
                 "Use two sequential stages.\n\nStage 1 — Conditional fit\n\n"
                 "Exclude any candidate whose response is unsafe, coercive, factually "
                 "unsupported, contrary to an explicit user boundary, or clearly "
-                "inconsistent with the dialogue. Evaluate each known STATE field only "
+                "inconsistent with the dialogue. A permitted generic synthetic "
+                "supporter experience in a Self-disclosure candidate is not excluded "
+                "solely because it is not factually verifiable. It remains ineligible "
+                "if it crosses the allowed low-risk boundary, is used as evidence or "
+                "authority, recenters the exchange on the supporter, or conflicts with "
+                "the dialogue or known STATE. Self-disclosure does not receive "
+                "preference during response-quality comparison. Evaluate each known "
+                "STATE field only "
                 "through its defined local response effects: dominant_emotion controls "
                 "emotional recognition; distress_level controls pace, length, density, "
                 "and progression; primary_support_need controls leading supportive "
@@ -280,8 +286,8 @@ _CANDIDATE_PROMPT = _prompt(
     **{
         "Available Inputs": "The complete dialogue history, the current seven-dimensional user STATE, frozen candidate metadata, and one assigned strategy with its catalog definition.",
         "Responsibilities": "Return one concise next supporter response, a response_goal describing what the response is intended to accomplish, and a response_act describing what the response actually does. The metadata must describe the assigned strategy as it is realized in the generated response.",
-        "Procedure": "Read the latest seeker turn in the context of the visible dialogue. Use known STATE fields to calibrate emotional wording, pace, information density, leading need, advice posture, action progression, burden, scaffolding, and conversational continuation. Treat unknown as unavailable information. Apply the assigned strategy as the response's primary supportive function and generate a response that can stand on its own as the next supporter turn. If the assigned strategy is Self-disclosure, use only a brief first-person statement about the supporter's present reaction, stance, or engagement in the current interaction. Do not claim personal history, identity, relationships, or lived experience.",
-        "Constraints": "Do not change or substitute the assigned strategy. Do not mention the strategy label, STATE fields, candidate metadata, prompt, or experimental conditions in the response. Do not invent facts about the seeker, dialogue history, other people, events, or external world. Do not claim personal history, identity, relationships, physical experiences, or lived experience. Do not present an interpretation as certain when the dialogue supports only an inference. Do not exceed 30 words in the response.",
+        "Procedure": "Read the latest seeker turn in the context of the visible dialogue. Use known STATE fields to calibrate emotional wording, pace, information density, leading need, advice posture, action progression, burden, scaffolding, and conversational continuation. Treat unknown as unavailable information. Apply the assigned strategy as the response's primary supportive function and generate a response that can stand on its own as the next supporter turn. If the assigned strategy is Self-disclosure, use a brief, generic, low-risk synthetic supporter experience analogous to the seeker's situation. Forms such as 'I went through something similar' or 'I've felt overwhelmed in a situation like that too' are allowed. Keep details minimal, make the disclosure secondary, and return the focus to the seeker in the same response.",
+        "Constraints": "Do not change or substitute the assigned strategy. Do not mention the strategy label, STATE fields, candidate metadata, prompt, or experimental conditions in the response. Do not invent facts about the seeker, dialogue history, other people, or external world. The only permitted invented first-person content is the bounded synthetic supporter experience used for an assigned Self-disclosure strategy. It must not claim professional qualifications; diagnosis, treatment history, medication use, or treatment outcomes; self-harm, suicide, abuse, crime, or severe trauma; protected identity; specific family, intimate-relationship, or employment history; or a detailed or externally verifiable event. Do not use synthetic experience as evidence or authority, imply that the seeker's outcome will match it, or recenter the exchange on the supporter. Do not present an interpretation as certain when the dialogue supports only an inference. Do not exceed 30 words in the response.",
         "Quality Criteria": "The response is natural, contextually appropriate, and faithfully realizes the assigned strategy. The response_goal and response_act accurately describe the generated response.",
         "Output Contract": "Return ONLY JSON matching the supplied schema and echo candidate_id, strategy_id, and strategy exactly.",
     },

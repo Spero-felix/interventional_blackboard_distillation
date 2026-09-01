@@ -1,4 +1,4 @@
-protocol_version: qwen25-socialsim-seven-state-policy-neutral-v1
+protocol_version: qwen25-socialsim-seven-state-policy-neutral-v2-synthetic-self-disclosure
 
 backend:
   base_url_env: OPENAI_BASE_URL
