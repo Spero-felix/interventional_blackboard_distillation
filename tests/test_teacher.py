@@ -1,12 +1,18 @@
 import json
+from pathlib import Path
 
 import pytest
 
-from conftest import ScriptedBackend
+from conftest import ScriptedBackend, VALID_STATE
 from ibd.backend import LLMResult
 from ibd.config import ModelConfig
-from ibd.prompting import PROMPT_ROLES, build_messages
-from ibd.schemas import Candidate, FinalSelectionDecision, StrategyPlanSet
+from ibd.prompting import ESCONV_STRATEGIES, PROMPT_ROLES, build_messages
+from ibd.schemas import (
+    Candidate,
+    FinalSelectionDecision,
+    MultiViewStateAnalysis,
+    StrategyPlanSet,
+)
 from ibd.teacher import NORMAL_ROLES, TeacherRunner, _PlainTextCandidateBackend
 
 
@@ -78,15 +84,7 @@ def test_candidate_prompt_contains_only_its_assigned_strategy(history):
         history,
         Candidate,
         context={
-            "state": {
-                "emotion": "失落",
-                "intensity": "中等",
-                "primary_need": "被理解",
-                "support_goal": "准备沟通",
-                "readiness": "愿意探索",
-                "main_constraint": "担心回避",
-                "relationship_context": "亲密关系",
-            },
+            "state": VALID_STATE,
             "candidate_id": "1",
             "strategy_id": "S1",
             "strategy": "Question",
@@ -98,18 +96,30 @@ def test_candidate_prompt_contains_only_its_assigned_strategy(history):
     assert '"seed"' not in prompt
 
 
-def test_planner_prompt_limits_others_to_dialogue_management(history):
+def test_analyzer_prompt_uses_seven_state_guide(history):
+    prompt = build_messages(
+        "multi_view_state_analyzer", history, MultiViewStateAnalysis
+    )[0]["content"]
+
+    assert "seven-dimensional user-state analyzer" in prompt
+    assert "advice_receptivity" in prompt
+    assert "unknown as a middle or low value" in prompt
+    assert "at most 20 words" not in prompt
+
+
+def test_planner_prompt_allows_only_meaningful_one_to_three_options(history):
     prompt = build_messages(
         "planner",
         history,
         StrategyPlanSet,
-        context={"state": {}},
+        context={"state": VALID_STATE},
     )[0]["content"]
 
-    assert "Others (Dialogue Management and Social Courtesy)" in prompt
-    assert "manage the conversational interaction itself" in prompt
-    assert "greetings, brief social acknowledgments, responses to gratitude" in prompt
-    assert "Never use Others as a fallback or merely to fill three strategy slots." in prompt
+    assert "between one and three" in prompt
+    assert "return only Others" in prompt
+    assert "merely to increase the number" in prompt
+    for strategy in ESCONV_STRATEGIES:
+        assert f"{strategy}:" in prompt
 
 
 def test_others_candidate_prompt_uses_only_the_positive_assigned_definition(history):
@@ -126,9 +136,9 @@ def test_others_candidate_prompt_uses_only_the_positive_assigned_definition(hist
     )[0]["content"]
 
     assert "# Assigned Strategy" in prompt
-    assert "Others (Dialogue Management and Social Courtesy)" in prompt
-    assert "manage the conversational interaction itself" in prompt
-    assert "seeker's situation, emotions, beliefs, decisions, or actions" in prompt
+    assert "Others:" in prompt
+    assert "interaction-management function is primary" in prompt
+    assert "more specific strategy instead" in prompt
     assert '"const": "Others"' in prompt
     assert "Providing Suggestions:" not in prompt
 
@@ -148,20 +158,36 @@ def test_final_selector_schema_cannot_contain_rewritten_response(history):
     }
 
 
-def test_final_selector_prompt_uses_ordered_response_quality_policy(history):
+def test_candidate_prompt_has_natural_fidelity_criterion(history):
+    prompt = build_messages(
+        "candidate",
+        history,
+        Candidate,
+        context={
+            "state": VALID_STATE,
+            "candidate_id": "1",
+            "strategy_id": "S1",
+            "strategy": "Self-disclosure",
+        },
+    )[0]["content"]
+
+    assert "natural, contextually appropriate" in prompt
+    assert "differs functionally from other candidates" not in prompt
+    assert "present reaction, stance, or engagement" in prompt
+
+
+def test_final_selector_uses_conditional_fit_then_quality(history):
     prompt = build_messages(
         "final_selector",
         history,
         FinalSelectionDecision,
-        context={"state": {}, "candidates": []},
+        context={"state": VALID_STATE, "candidates": []},
     )[0]["content"]
 
-    assert "actual candidate response" in prompt
-    assert "Direct fit to the seeker's latest turn" in prompt
-    assert "Emotional attunement and respect for the seeker's autonomy" in prompt
-    assert "concrete, autonomy-preserving response" in prompt
-    assert "Do not favor a candidate because of its ID, order, or strategy name." in prompt
-    assert "must accurately describe the selected response" in prompt
+    assert "Stage 1 — Conditional fit" in prompt
+    assert "Stage 2 — Response quality" in prompt
+    assert "STATE.primary_need" not in prompt
+    assert "concrete, autonomy-preserving" not in prompt
 
 
 def test_final_selector_prompt_gates_others_by_primary_function(history):
@@ -172,10 +198,8 @@ def test_final_selector_prompt_gates_others_by_primary_function(history):
         context={"state": {}, "candidates": []},
     )[0]["content"]
 
-    assert "Others (Dialogue Management and Social Courtesy)" in prompt
-    assert "Select Others only when" in prompt
-    assert "latest seeker turn" in prompt
-    assert "that more specific strategy takes precedence over Others" in prompt
+    assert "actual response" in prompt
+    assert "strategy name as selection evidence" in prompt
 
 
 def test_selector_response_is_taken_verbatim_from_candidate(history, app_config):
@@ -211,11 +235,10 @@ def test_state_counterfactual_generator_is_a_single_local_call(history, app_conf
     replacement = runner.generate_state_counterfactual(
         history,
         trace.state,
-        "readiness",
-        "timing",
+        "advice_receptivity",
         example_id="e-base:cf",
     )
-    assert replacement == "准备立即采取具体行动"
+    assert replacement in {"closed", "open", "requested"}
     assert [call["role"] for call in backend.calls] == [
         "state_counterfactual_generator"
     ]
@@ -233,7 +256,7 @@ def test_fixed_plan_response_uses_the_plan_as_an_authoritative_candidate_conditi
         history,
         trace.state,
         trace.final_selection.to_plan_selection(),
-        clamped_state_field="readiness",
+        clamped_state_field="advice_receptivity",
         example_id="e-base:fixed-plan",
     )
 
@@ -241,7 +264,7 @@ def test_fixed_plan_response_uses_the_plan_as_an_authoritative_candidate_conditi
     assert [call["role"] for call in backend.calls] == ["candidate"]
     system_prompt = backend.calls[0]["messages"][0]["content"]
     assert "Experimental PLAN Clamp" in system_prompt
-    assert "must not replan" in system_prompt
+    assert "without replanning" in system_prompt
 
 
 def test_prompt_registry_contains_only_current_roles():
@@ -255,6 +278,21 @@ def test_prompt_registry_contains_only_current_roles():
         "state_effect_verifier",
         "safety_verifier",
     }
+
+
+def test_teacher_configs_use_policy_neutral_protocol():
+    from ibd.config import AppConfig
+
+    repository = Path(__file__).parents[1]
+    for relative_path in (
+        "configs/deepseek_teacher.yaml",
+        "configs/deepseek_teacher_phase_balanced_v4.yaml",
+    ):
+        config = AppConfig.from_yaml(repository / relative_path)
+        assert (
+            config.protocol_version
+            == "qwen25-socialsim-seven-state-policy-neutral-v1"
+        )
 
 
 def test_plain_text_candidate_provider_is_wrapped(history):
@@ -281,6 +319,47 @@ def test_plain_text_candidate_provider_is_wrapped(history):
     )
     trace = TeacherRunner(PlainBackend(), config).run("e-plain", history)
     assert [item.response for item in trace.candidates] == ["一句自然回复"] * 3
+    candidate_records = [
+        record for record in trace.call_records if record.role == "candidate"
+    ]
+    assert len(candidate_records) == 6
+    assert [record.metadata_fallback for record in candidate_records] == [
+        False,
+        True,
+    ] * 3
+
+
+@pytest.mark.parametrize("count", [1, 2, 3])
+def test_teacher_generates_one_candidate_per_planned_strategy(
+    history, app_config, count
+):
+    class VariablePlanBackend(ScriptedBackend):
+        def _payload(self, role, seed):
+            if role == "planner":
+                return {
+                    "strategies": [
+                        "Question",
+                        "Reflection of feelings",
+                        "Information",
+                    ][:count]
+                }
+            if role == "final_selector":
+                return {
+                    "selected_candidate_id": "1",
+                    "response_goal": "support the immediate goal",
+                    "response_act": "apply the selected strategy",
+                }
+            return super()._payload(role, seed)
+
+    trace = TeacherRunner(VariablePlanBackend(), app_config).run(
+        f"e-cardinality-{count}", history
+    )
+
+    assert len(trace.plan.strategies) == count
+    assert len(trace.candidates) == count
+    assert [candidate.candidate_id for candidate in trace.candidates] == [
+        str(index) for index in range(1, count + 1)
+    ]
 
 
 def test_plain_text_candidate_adapter_unwraps_one_valid_json_fence():

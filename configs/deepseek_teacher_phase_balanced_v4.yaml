@@ -1,4 +1,4 @@
-protocol_version: qwen25-socialsim-single-strategy-v4
+protocol_version: qwen25-socialsim-seven-state-policy-neutral-v1
 
 backend:
   base_url_env: OPENAI_BASE_URL

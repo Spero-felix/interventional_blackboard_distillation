@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 FunctionName = Literal["STATE", "PLAN"]
 StrategyId = Literal["S1", "S2", "S3"]
@@ -23,9 +23,69 @@ NonSafetyDimension = Literal[
     "effectiveness", "autonomy", "factuality", "non_template",
 ]
 MASKED_STATE_VALUE = "<MASKED>"
-STATE_ANCHOR_FIELDS = (
-    "emotion", "intensity", "primary_need", "support_goal", "readiness",
-    "main_constraint", "relationship_context",
+DominantEmotion = Literal[
+    "sadness_loss",
+    "fear_anxiety",
+    "anger_frustration",
+    "shame_guilt",
+    "hurt_disappointment",
+    "loneliness",
+    "overwhelm",
+    "relief",
+    "hope_positive",
+    "neutral",
+    "mixed",
+    "other",
+    "unknown",
+]
+DistressLevel = Literal["low", "moderate", "high", "unknown"]
+PrimarySupportNeed = Literal[
+    "emotional_expression",
+    "validation",
+    "esteem_support",
+    "sensemaking",
+    "information",
+    "decision_support",
+    "action_support",
+    "connection",
+    "unknown",
+]
+AdviceReceptivity = Literal[
+    "closed", "hesitant", "open", "requested", "unknown"
+]
+ActionIntent = Literal[
+    "not_considering",
+    "ambivalent",
+    "considering",
+    "committed",
+    "acting",
+    "unknown",
+]
+ActionCapacity = Literal["blocked", "limited", "adequate", "strong", "unknown"]
+ContinuationIntent = Literal[
+    "closing",
+    "passive_open",
+    "engaged",
+    "explicitly_continuing",
+    "unknown",
+]
+StateField = Literal[
+    "dominant_emotion",
+    "distress_level",
+    "primary_support_need",
+    "advice_receptivity",
+    "action_intent",
+    "action_capacity",
+    "continuation_intent",
+]
+STATE_ANCHOR_FIELDS: tuple[StateField, ...] = (
+    "dominant_emotion",
+    "distress_level",
+    "primary_support_need",
+    "advice_receptivity",
+    "action_intent",
+    "action_capacity",
+    "continuation_intent",
 )
 
 
@@ -65,40 +125,51 @@ class MultiViewStateViews(StrictModel):
 
 
 class StateBlackboard(StrictModel):
-    emotion: str
-    intensity: str
-    primary_need: str
-    support_goal: str
-    readiness: str
-    main_constraint: str
-    relationship_context: str
+    dominant_emotion: DominantEmotion
+    distress_level: DistressLevel
+    primary_support_need: PrimarySupportNeed
+    advice_receptivity: AdviceReceptivity
+    action_intent: ActionIntent
+    action_capacity: ActionCapacity
+    continuation_intent: ContinuationIntent
 
-    @field_validator(*STATE_ANCHOR_FIELDS, mode="before")
-    @classmethod
-    def normalize_compact_value(cls, value: object) -> object:
-        if not isinstance(value, str):
-            return value
-        normalized = " ".join(value.split())
-        if not normalized:
-            raise ValueError("STATE values must not be empty")
-        if len(normalized.split()) > 20:
-            raise ValueError("STATE values must contain at most 20 words")
-        return normalized
 
-    @model_validator(mode="after")
-    def require_distinct_values(self) -> "StateBlackboard":
-        values = [getattr(self, field) for field in STATE_ANCHOR_FIELDS]
-        if values.count(MASKED_STATE_VALUE) > 1:
-            raise ValueError("STATE may contain only a single <MASKED> value")
-        visible = [value.casefold() for value in values if value != MASKED_STATE_VALUE]
-        if len(set(visible)) != len(visible):
-            raise ValueError("STATE values must be distinct after normalization")
-        return self
+EvidenceBasis = Literal[
+    "explicit", "strong_inference", "absent_or_ambiguous"
+]
+
+
+class StateFieldEvidence(StrictModel):
+    evidence: str = ""
+    basis: EvidenceBasis
+
+
+class StateEvidence(StrictModel):
+    dominant_emotion: StateFieldEvidence
+    distress_level: StateFieldEvidence
+    primary_support_need: StateFieldEvidence
+    advice_receptivity: StateFieldEvidence
+    action_intent: StateFieldEvidence
+    action_capacity: StateFieldEvidence
+    continuation_intent: StateFieldEvidence
 
 
 class MultiViewStateAnalysis(StrictModel):
     views: MultiViewStateViews
     state: StateBlackboard
+    state_evidence: StateEvidence
+
+    @model_validator(mode="after")
+    def require_evidence_consistency(self) -> "MultiViewStateAnalysis":
+        for field in STATE_ANCHOR_FIELDS:
+            value = getattr(self.state, field)
+            evidence = getattr(self.state_evidence, field)
+            absent = evidence.basis == "absent_or_ambiguous"
+            if (value == "unknown") != absent:
+                raise ValueError(f"{field} value and evidence basis disagree")
+            if value != "unknown" and not evidence.evidence.strip():
+                raise ValueError(f"{field} requires non-blank evidence")
+        return self
 
 
 class StateCounterfactual(StrictModel):
@@ -106,16 +177,19 @@ class StateCounterfactual(StrictModel):
 
 
 class StrategyPlanSet(StrictModel):
-    strategies: Annotated[list[StrategyName], Field(min_length=3, max_length=3)]
+    strategies: Annotated[list[StrategyName], Field(min_length=1, max_length=3)]
 
     @model_validator(mode="after")
     def require_distinct_strategies(self) -> "StrategyPlanSet":
-        if len(set(self.strategies)) != 3:
-            raise ValueError("strategy plan must use three distinct strategies")
+        if len(set(self.strategies)) != len(self.strategies):
+            raise ValueError("strategy plan must use distinct strategies")
         return self
 
     def strategy_for_id(self, strategy_id: StrategyId) -> StrategyName:
-        return self.strategies[{"S1": 0, "S2": 1, "S3": 2}[strategy_id]]
+        index = {"S1": 0, "S2": 1, "S3": 2}[strategy_id]
+        if index >= len(self.strategies):
+            raise ValueError(f"{strategy_id} is absent from this strategy plan")
+        return self.strategies[index]
 
 
 class Candidate(StrictModel):
@@ -189,6 +263,7 @@ class CallRecord(StrictModel):
     raw_text: str
     parsed: dict[str, Any]
     schema_retry: bool = False
+    metadata_fallback: bool = False
     cached: bool = False
 
 
@@ -199,7 +274,7 @@ class TeacherTrace(StrictModel):
     state_analysis: MultiViewStateAnalysis
     state: StateBlackboard
     plan: StrategyPlanSet
-    candidates: Annotated[list[Candidate], Field(min_length=3, max_length=3)]
+    candidates: Annotated[list[Candidate], Field(min_length=1, max_length=3)]
     final_selection: FinalSelection
     final_response: str = Field(min_length=1)
     call_records: list[CallRecord]
@@ -247,7 +322,7 @@ class InterventionRecord(StrictModel):
     full_response: str = Field(min_length=1)
     counterfactual_response: str = Field(min_length=1)
     target_dimension: NonSafetyDimension
-    affected_dimensions: list[NonSafetyDimension] = Field(default_factory=list)
+    affected_non_target_fields: list[StateField] = Field(default_factory=list)
     conditioning_contract: Literal[
         "legacy_joint_downstream_v1", "single_variable_v1"
     ] = "legacy_joint_downstream_v1"

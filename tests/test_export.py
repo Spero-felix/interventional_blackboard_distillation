@@ -30,13 +30,13 @@ def test_visible_sft_target_preserves_state_strategy_and_response(history, app_c
     trace = TeacherRunner(ScriptedBackend(), app_config).run("e-visible", history)
 
     assert serialize_visible_sft(trace) == (
-        f"[emotion]{trace.state.emotion}"
-        f"[intensity]{trace.state.intensity}"
-        f"[primary_need]{trace.state.primary_need}"
-        f"[support_goal]{trace.state.support_goal}"
-        f"[readiness]{trace.state.readiness}"
-        f"[main_constraint]{trace.state.main_constraint}"
-        f"[relationship_context]{trace.state.relationship_context}"
+        f"[dominant_emotion]{trace.state.dominant_emotion}"
+        f"[distress_level]{trace.state.distress_level}"
+        f"[primary_support_need]{trace.state.primary_support_need}"
+        f"[advice_receptivity]{trace.state.advice_receptivity}"
+        f"[action_intent]{trace.state.action_intent}"
+        f"[action_capacity]{trace.state.action_capacity}"
+        f"[continuation_intent]{trace.state.continuation_intent}"
         f"[selected_strategy]{trace.final_selection.selected_strategy}"
         f"[response]{trace.final_response}"
     )
@@ -47,7 +47,7 @@ def test_visible_sft_response_parser_rejects_missing_or_empty_marker():
     from ibd.visible_sft import parse_visible_sft_response
 
     with pytest.raises(ValueError, match=r"\[response\]"):
-        parse_visible_sft_response("[emotion]sad")
+        parse_visible_sft_response("[dominant_emotion]sadness_loss")
     with pytest.raises(ValueError, match="must not be empty"):
         parse_visible_sft_response("[response]")
 
@@ -92,7 +92,7 @@ def test_intervention_export_has_no_quality_direction_labels(history, app_config
         "full_response",
         "counterfactual_response",
         "target_dimension",
-        "affected_dimensions",
+        "affected_non_target_fields",
         "conditional_correspondence_verified",
     }
     assert "chosen" not in row

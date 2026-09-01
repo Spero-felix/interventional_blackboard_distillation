@@ -15,7 +15,13 @@ from transformers import PreTrainedTokenizerBase
 
 from .config import STATE_TOKEN_LIMIT
 from .model import QwenSlotCausalLM
-from .schemas import PlanSelection, STATE_ANCHOR_FIELDS, StateBlackboard
+from .schemas import (
+    MASKED_STATE_VALUE,
+    PlanSelection,
+    STATE_ANCHOR_FIELDS,
+    StateBlackboard,
+    StateField,
+)
 
 
 _METADATA_KEY = "ibd_anchor_metadata"
@@ -24,6 +30,16 @@ _MUTATED_STATE_ROWS_KEY = "ibd_mutated_state_to_row"
 _MUTATED_PLAN_ROWS_KEY = "ibd_mutated_plan_to_row"
 def state_anchor_payload(state: StateBlackboard) -> dict[str, str]:
     return {field: getattr(state, field) for field in STATE_ANCHOR_FIELDS}
+
+
+def masked_state_anchor_payload(
+    state: StateBlackboard, field: StateField
+) -> dict[str, str]:
+    """Mask one field only in a temporary diagnostic anchor payload."""
+
+    payload = state_anchor_payload(state)
+    payload[field] = MASKED_STATE_VALUE
+    return payload
 
 
 def plan_anchor_payload(selection: PlanSelection) -> dict[str, str]:

@@ -105,9 +105,10 @@ def test_static_visible_sft_dataset_validates_format_and_preserves_splits(
     from ibd.pipeline import read_visible_sft_dataset
 
     target = (
-        "[emotion]sad[intensity]high[primary_need]connection"
-        "[support_goal]clarity[readiness]ready[main_constraint]fear"
-        "[relationship_context]partner[selected_strategy]Question"
+        "[dominant_emotion]sadness_loss[distress_level]high"
+        "[primary_support_need]connection[advice_receptivity]open"
+        "[action_intent]considering[action_capacity]limited"
+        "[continuation_intent]engaged[selected_strategy]Question"
         "[response]What feels safest to say first?"
     )
     path = tmp_path / "visible-sft.jsonl"
@@ -185,14 +186,14 @@ def test_export_visible_sft_writes_static_training_rows(
             "example_id": "e-visible-cli",
             "split": "train",
             "history": history.model_dump(mode="json"),
-            "response": (
-                f"[emotion]{trace.state.emotion}"
-                f"[intensity]{trace.state.intensity}"
-                f"[primary_need]{trace.state.primary_need}"
-                f"[support_goal]{trace.state.support_goal}"
-                f"[readiness]{trace.state.readiness}"
-                f"[main_constraint]{trace.state.main_constraint}"
-                f"[relationship_context]{trace.state.relationship_context}"
+                "response": (
+                    f"[dominant_emotion]{trace.state.dominant_emotion}"
+                    f"[distress_level]{trace.state.distress_level}"
+                    f"[primary_support_need]{trace.state.primary_support_need}"
+                    f"[advice_receptivity]{trace.state.advice_receptivity}"
+                    f"[action_intent]{trace.state.action_intent}"
+                    f"[action_capacity]{trace.state.action_capacity}"
+                    f"[continuation_intent]{trace.state.continuation_intent}"
                 f"[selected_strategy]{trace.final_selection.selected_strategy}"
                 f"[response]{trace.final_response}"
             ),
@@ -549,13 +550,13 @@ def test_cli_registers_complete_qwen_pipeline_command_surface():
             "--global-seed",
             "73",
             "--diagnostic-state-field",
-            "primary_need",
+                "primary_support_need",
             "--original-splits",
             "dev",
         ]
     )
     assert anchor_args.global_seed == 73
-    assert anchor_args.diagnostic_state_field == "primary_need"
+    assert anchor_args.diagnostic_state_field == "primary_support_need"
     assert anchor_args.original_splits == ["dev"]
 
     evaluate_args = parser.parse_args(

@@ -12,6 +12,12 @@ from .schemas import History
 
 IBD_STATE_TOKEN = "<|ibd_state|>"
 IBD_PLAN_TOKEN = "<|ibd_plan|>"
+STUDENT_SYSTEM_PROMPT = (
+    "You are an AI mental-health support counselor. Provide compassionate, "
+    "attentive, and context-sensitive conversational support based on the visible "
+    "dialogue. Respond naturally and respect the seeker's autonomy, pace, boundaries, "
+    "and expressed needs. Avoid unsupported assumptions and diagnosis."
+)
 
 
 def add_ibd_tokens(tokenizer: Any) -> dict[str, int]:
@@ -29,7 +35,7 @@ def add_ibd_tokens(tokenizer: Any) -> dict[str, int]:
 def history_messages(history: History | Mapping[str, Any]) -> list[dict[str, str]]:
     parsed = history if isinstance(history, History) else History.model_validate(history)
     role_map = {"seeker": "user", "supporter": "assistant"}
-    return [
+    return [{"role": "system", "content": STUDENT_SYSTEM_PROMPT}] + [
         {"role": role_map[turn.role], "content": turn.content}
         for turn in parsed.turns
     ]

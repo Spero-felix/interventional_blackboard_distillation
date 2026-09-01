@@ -18,6 +18,7 @@ from .schemas import (
     PlanSelection,
     STATE_ANCHOR_FIELDS,
     StateBlackboard,
+    StateField,
     StrictModel,
     TeacherTrace,
 )
@@ -34,8 +35,9 @@ class ConditionalEffectVerdict(StrictModel):
 class StateEffectVerdict(StrictModel):
     condition_a_fit: bool
     condition_b_fit: bool
-    field_effect_present: bool
-    affected_dimensions: list[NonSafetyDimension] = Field(default_factory=list)
+    target_effect_present: bool
+    localized_effect: bool
+    affected_non_target_fields: list[StateField] = Field(default_factory=list)
     evidence: str = Field(min_length=1)
 
 
@@ -43,34 +45,40 @@ ExclusionReason = Literal[
     "state_not_single_field",
     "invalid_state_counterfactual",
     "plan_overlap",
+    "plan_no_alternative",
     "bidirectional_disagreement",
     "safety_failure",
     "no_localized_effect",
+    "non_localized_effect",
 ]
-EffectFailureReason = Literal["bidirectional_disagreement", "no_localized_effect"]
-StateField = Literal[
-    "emotion",
-    "intensity",
-    "primary_need",
-    "support_goal",
-    "readiness",
-    "main_constraint",
-    "relationship_context",
+EffectFailureReason = Literal[
+    "bidirectional_disagreement",
+    "no_localized_effect",
+    "non_localized_effect",
 ]
+STATE_TARGET_DIMENSIONS: dict[StateField, NonSafetyDimension] = {
+    "dominant_emotion": "emotion",
+    "distress_level": "timing",
+    "primary_support_need": "need",
+    "advice_receptivity": "autonomy",
+    "action_intent": "intent",
+    "action_capacity": "effectiveness",
+    "continuation_intent": "timing",
+}
 
 
 @dataclass(frozen=True)
 class EffectVerification:
     passed: bool
     reason: EffectFailureReason | None = None
-    affected_dimensions: tuple[NonSafetyDimension, ...] = ()
+    affected_non_target_fields: tuple[StateField, ...] = ()
 
     def __post_init__(self) -> None:
         if self.passed and self.reason is not None:
             raise ValueError("successful verification must not have a reason")
         if not self.passed and self.reason is None:
             raise ValueError("failed verification must have a reason")
-        if not self.passed and self.affected_dimensions:
+        if not self.passed and self.affected_non_target_fields:
             raise ValueError("failed verification cannot carry effect metadata")
 
 
@@ -78,19 +86,6 @@ class InterventionExcluded(Exception):
     def __init__(self, reason: ExclusionReason):
         super().__init__(reason)
         self.reason = reason
-
-
-def mask_state_field(
-    state: StateBlackboard, field: StateField
-) -> tuple[StateBlackboard, Mutation]:
-    before = getattr(state, field)
-    mutated = state.model_copy(update={field: MASKED_STATE_VALUE})
-    return mutated, Mutation(
-        operation="mask_state_field",
-        field=field,
-        before=before,
-        after=MASKED_STATE_VALUE,
-    )
 
 
 def replace_state_field(
@@ -142,8 +137,8 @@ def select_counterfactual_plan(
         (item for item in candidates if item.candidate_id != selected_candidate_id),
         key=lambda item: item.candidate_id,
     )
-    if len(alternatives) != 2:
-        raise ValueError("PLAN counterfactual requires exactly two unselected candidates")
+    if not alternatives:
+        raise ValueError("PLAN counterfactual requires at least one unselected candidate")
     rng = random.Random(f"{global_seed}:{example_id}")
     counterfactual = PlanSelection.from_candidate(
         alternatives[rng.randrange(len(alternatives))]
@@ -195,25 +190,17 @@ class InterventionBuilder:
                 for field in STATE_ANCHOR_FIELDS
             ):
                 raise InterventionExcluded("state_not_single_field")
-            dimension: NonSafetyDimension = {
-                "emotion": "emotion",
-                "intensity": "emotion",
-                "primary_need": "need",
-                "support_goal": "intent",
-                "readiness": "timing",
-                "main_constraint": "effectiveness",
-                "relationship_context": "relationship",
-            }[state_field]
-            replacement = self.runner.generate_state_counterfactual(
-                trace.history,
-                trace.state,
-                state_field,
-                dimension,
-                example_id=(
-                    f"{trace.example_id}:intervention:STATE:{state_field}:counterfactual"
-                ),
-            )
+            dimension = STATE_TARGET_DIMENSIONS[state_field]
             try:
+                replacement = self.runner.generate_state_counterfactual(
+                    trace.history,
+                    trace.state,
+                    state_field,
+                    example_id=(
+                        f"{trace.example_id}:intervention:STATE:"
+                        f"{state_field}:counterfactual"
+                    ),
+                )
                 mutated_state, mutation = replace_state_field(
                     trace.state, state_field, replacement
                 )
@@ -243,6 +230,8 @@ class InterventionBuilder:
                 counterfactual_response,
             )
         else:
+            if len(trace.candidates) < 2:
+                raise InterventionExcluded("plan_no_alternative")
             original_plan = trace.final_selection.to_plan_selection()
             mutated_plan, mutation = select_counterfactual_plan(
                 candidates=trace.candidates,
@@ -279,7 +268,9 @@ class InterventionBuilder:
             full_response=trace.final_response,
             counterfactual_response=counterfactual_response,
             target_dimension=dimension,
-            affected_dimensions=list(verification.affected_dimensions),
+            affected_non_target_fields=list(
+                verification.affected_non_target_fields
+            ),
             conditioning_contract=(
                 "single_variable_v1"
                 if state_plan_policy == "fixed_original"

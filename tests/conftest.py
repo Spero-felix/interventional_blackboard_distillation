@@ -4,6 +4,25 @@ from typing import Any
 import pytest
 
 
+VALID_STATE = {
+    "dominant_emotion": "hurt_disappointment",
+    "distress_level": "moderate",
+    "primary_support_need": "decision_support",
+    "advice_receptivity": "hesitant",
+    "action_intent": "considering",
+    "action_capacity": "limited",
+    "continuation_intent": "engaged",
+}
+
+VALID_STATE_EVIDENCE = {
+    field: {
+        "evidence": f"dialogue evidence for {field}",
+        "basis": "strong_inference",
+    }
+    for field in VALID_STATE
+}
+
+
 class ScriptedBackend:
     """Network-free backend that emits complete production-shaped JSON."""
 
@@ -35,7 +54,11 @@ class ScriptedBackend:
                 "response_act": f"候选动作-{candidate_id}",
             }
         else:
-            payload = self._payload(role, seed)
+            if role == "state_counterfactual_generator":
+                context = json.loads(messages[1]["content"])["context"]
+                payload = {"replacement": context["allowed_replacements"][0]}
+            else:
+                payload = self._payload(role, seed)
         return LLMResult(text=json.dumps(payload, ensure_ascii=False), usage={"total_tokens": 10})
 
     def _payload(self, role: str, seed: int | None):
@@ -91,28 +114,11 @@ class ScriptedBackend:
                         "uncertainty": "",
                     },
                 },
-                "state": {
-                    "emotion": "失落",
-                    "intensity": "中等",
-                    "primary_need": "被理解",
-                    "support_goal": "准备一次坦诚沟通",
-                    "readiness": "愿意探索",
-                    "main_constraint": "担心对方继续回避",
-                    "relationship_context": "亲密关系中的沟通僵局",
-                },
+                "state": VALID_STATE,
+                "state_evidence": VALID_STATE_EVIDENCE,
             }
         if role == "state_integrator":
-            return {
-                "emotion": "失落",
-                "intensity": "中等",
-                "primary_need": "被理解",
-                "support_goal": "准备一次坦诚沟通",
-                "readiness": "愿意探索",
-                "main_constraint": "担心对方继续回避",
-                "relationship_context": "亲密关系中的沟通僵局",
-            }
-        if role == "state_counterfactual_generator":
-            return {"replacement": "准备立即采取具体行动"}
+            return VALID_STATE
         if role == "planner":
             return {
                 "strategies": [

@@ -93,13 +93,31 @@ def aggregate_intervention_audit(
             "exclusion_reasons": dict(sorted(reasons.items())),
         }
         if function == "STATE":
-            coverage = Counter(
+            attempts_by_field = Counter(
                 str(row["state_field"])
                 for row in rows
                 if row.get("state_field") is not None
             )
-            common["field_coverage"] = {
-                field: coverage[field] for field in STATE_ANCHOR_FIELDS
+            retained_by_field = Counter(
+                str(row["state_field"])
+                for row in rows
+                if row.get("state_field") is not None
+                and row.get("status") == "retained"
+            )
+            non_local_by_field = Counter(
+                str(row["state_field"])
+                for row in rows
+                if row.get("state_field") is not None
+                and row.get("exclusion_reason") == "non_localized_effect"
+            )
+            common["field_attempts"] = {
+                field: attempts_by_field[field] for field in STATE_ANCHOR_FIELDS
+            }
+            common["field_retained"] = {
+                field: retained_by_field[field] for field in STATE_ANCHOR_FIELDS
+            }
+            common["field_non_local_rejections"] = {
+                field: non_local_by_field[field] for field in STATE_ANCHOR_FIELDS
             }
         else:
             existing_candidate_count = 0

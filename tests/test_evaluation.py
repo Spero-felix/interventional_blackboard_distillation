@@ -107,7 +107,7 @@ def test_intervention_audit_reports_state_coverage_and_plan_candidate_reuse():
                 "function": "STATE",
                 "eligibility": "eligible",
                 "status": "retained",
-                "state_field": "emotion",
+                "state_field": "dominant_emotion",
                 "exclusion_reason": None,
             },
             {
@@ -115,7 +115,7 @@ def test_intervention_audit_reports_state_coverage_and_plan_candidate_reuse():
                 "function": "STATE",
                 "eligibility": "ineligible",
                 "status": "excluded",
-                "state_field": "intensity",
+                "state_field": "distress_level",
                 "exclusion_reason": "state_not_single_field",
             },
             {
@@ -154,14 +154,32 @@ def test_intervention_audit_reports_state_coverage_and_plan_candidate_reuse():
         "eligibility": {"eligible": 1, "ineligible": 1},
         "status": {"retained": 1, "excluded": 1},
         "exclusion_reasons": {"state_not_single_field": 1},
-        "field_coverage": {
-            "emotion": 1,
-            "intensity": 1,
-            "primary_need": 0,
-            "support_goal": 0,
-            "readiness": 0,
-            "main_constraint": 0,
-            "relationship_context": 0,
+        "field_attempts": {
+            "dominant_emotion": 1,
+            "distress_level": 1,
+            "primary_support_need": 0,
+            "advice_receptivity": 0,
+            "action_intent": 0,
+            "action_capacity": 0,
+            "continuation_intent": 0,
+        },
+        "field_retained": {
+            "dominant_emotion": 1,
+            "distress_level": 0,
+            "primary_support_need": 0,
+            "advice_receptivity": 0,
+            "action_intent": 0,
+            "action_capacity": 0,
+            "continuation_intent": 0,
+        },
+        "field_non_local_rejections": {
+            "dominant_emotion": 0,
+            "distress_level": 0,
+            "primary_support_need": 0,
+            "advice_receptivity": 0,
+            "action_intent": 0,
+            "action_capacity": 0,
+            "continuation_intent": 0,
         },
     }
     assert result["PLAN"] == {

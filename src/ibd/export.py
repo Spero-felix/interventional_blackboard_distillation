@@ -57,7 +57,7 @@ def intervention_row(record: InterventionRecord, prompt: str) -> dict[str, Any]:
         "full_response": record.full_response,
         "counterfactual_response": record.counterfactual_response,
         "target_dimension": record.target_dimension,
-        "affected_dimensions": list(record.affected_dimensions),
+        "affected_non_target_fields": list(record.affected_non_target_fields),
         "conditional_correspondence_verified": (
             record.conditional_correspondence_verified
         ),

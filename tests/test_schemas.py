@@ -11,23 +11,100 @@ from ibd.schemas import (
     MultiViewStateAnalysis,
     MultiViewStateViews,
     PlanSelection,
+    STATE_ANCHOR_FIELDS,
     StateBlackboard,
     StrategyPlanSet,
 )
 
 
-def _state(**overrides):
-    values = {
-        "emotion": "失落",
-        "intensity": "中等",
-        "primary_need": "被理解",
-        "support_goal": "准备坦诚沟通",
-        "readiness": "愿意探索",
-        "main_constraint": "担心对方回避",
-        "relationship_context": "亲密关系沟通僵局",
+VALID_STATE = {
+    "dominant_emotion": "hurt_disappointment",
+    "distress_level": "moderate",
+    "primary_support_need": "decision_support",
+    "advice_receptivity": "hesitant",
+    "action_intent": "considering",
+    "action_capacity": "limited",
+    "continuation_intent": "engaged",
+}
+
+EXPECTED_STATE_VALUES = {
+    "dominant_emotion": (
+        "sadness_loss",
+        "fear_anxiety",
+        "anger_frustration",
+        "shame_guilt",
+        "hurt_disappointment",
+        "loneliness",
+        "overwhelm",
+        "relief",
+        "hope_positive",
+        "neutral",
+        "mixed",
+        "other",
+        "unknown",
+    ),
+    "distress_level": ("low", "moderate", "high", "unknown"),
+    "primary_support_need": (
+        "emotional_expression",
+        "validation",
+        "esteem_support",
+        "sensemaking",
+        "information",
+        "decision_support",
+        "action_support",
+        "connection",
+        "unknown",
+    ),
+    "advice_receptivity": ("closed", "hesitant", "open", "requested", "unknown"),
+    "action_intent": (
+        "not_considering",
+        "ambivalent",
+        "considering",
+        "committed",
+        "acting",
+        "unknown",
+    ),
+    "action_capacity": ("blocked", "limited", "adequate", "strong", "unknown"),
+    "continuation_intent": (
+        "closing",
+        "passive_open",
+        "engaged",
+        "explicitly_continuing",
+        "unknown",
+    ),
+}
+
+VALID_EVIDENCE = {
+    field: {
+        "evidence": f"dialogue evidence for {field}",
+        "basis": "strong_inference",
     }
-    values.update(overrides)
-    return StateBlackboard(**values)
+    for field in VALID_STATE
+}
+
+
+def _state(**overrides):
+    return StateBlackboard(**{**VALID_STATE, **overrides})
+
+
+def _analysis(*, state=None, evidence=None):
+    view = lambda summary: AnalysisView(summary=summary, evidence="dialogue quote")
+    return MultiViewStateAnalysis(
+        views=MultiViewStateViews(
+            emotion=view("hurt"),
+            need=view("decision support"),
+            relationship=view("relationship tension"),
+            intent=view("considering action"),
+        ),
+        state=VALID_STATE if state is None else state,
+        state_evidence=VALID_EVIDENCE if evidence is None else evidence,
+    )
+
+
+def _evidence_with(field, *, evidence, basis):
+    payload = {key: dict(value) for key, value in VALID_EVIDENCE.items()}
+    payload[field] = {"evidence": evidence, "basis": basis}
+    return payload
 
 
 def test_history_must_end_with_seeker():
@@ -40,36 +117,142 @@ def test_history_must_end_with_seeker():
         )
 
 
-def test_state_is_compact_normalized_and_distinct():
-    state = _state(primary_need="  希望\n被听见 ")
-    assert state.primary_need == "希望 被听见"
-    with pytest.raises(ValidationError, match="distinct"):
-        _state(emotion="需要 空间", primary_need=" 需要  空间 ")
-    with pytest.raises(ValidationError, match="at most 20 words"):
-        _state(main_constraint=" ".join(f"w{i}" for i in range(21)))
+def test_state_has_exactly_seven_ordered_fields():
+    assert STATE_ANCHOR_FIELDS == tuple(VALID_STATE)
+    assert tuple(_state().model_dump()) == STATE_ANCHOR_FIELDS
 
 
-def test_unified_analysis_contains_four_views_and_one_state():
-    view = lambda summary: AnalysisView(summary=summary, evidence="对话证据")
-    analysis = MultiViewStateAnalysis(
-        views=MultiViewStateViews(
-            emotion=view("失落"),
-            need=view("被理解"),
-            relationship=view("回避沟通"),
-            intent=view("准备开口"),
+def test_state_accepts_every_declared_enum_value():
+    for field, values in EXPECTED_STATE_VALUES.items():
+        for value in values:
+            assert getattr(_state(**{field: value}), field) == value
+
+
+@pytest.mark.parametrize("field", tuple(VALID_STATE))
+def test_state_rejects_value_outside_target_field_enum(field):
+    with pytest.raises(ValidationError):
+        _state(**{field: "invalid"})
+
+
+def test_state_json_schema_exposes_each_fields_exact_values():
+    properties = StateBlackboard.model_json_schema()["properties"]
+    for field, values in EXPECTED_STATE_VALUES.items():
+        assert properties[field]["enum"] == list(values)
+
+
+def test_old_state_shape_is_rejected_directly():
+    with pytest.raises(ValidationError) as caught:
+        StateBlackboard(
+            emotion="失落",
+            intensity="中等",
+            primary_need="被理解",
+            support_goal="准备沟通",
+            readiness="愿意探索",
+            main_constraint="担心回避",
+            relationship_context="亲密关系",
+        )
+    errors = caught.value.errors()
+    assert any(error["type"] == "missing" for error in errors)
+    assert any(error["type"] == "extra_forbidden" for error in errors)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"advice_receptivity": "requested", "action_intent": "not_considering"},
+        {"action_intent": "committed", "action_capacity": "blocked"},
+        {"continuation_intent": "engaged", "advice_receptivity": "closed"},
+        {"continuation_intent": "closing", "action_intent": "acting"},
+        {"dominant_emotion": "neutral", "distress_level": "high"},
+    ],
+)
+def test_state_dimensions_allow_orthogonal_combinations(overrides):
+    assert _state(**overrides)
+
+
+def test_unified_analysis_contains_views_state_and_field_evidence():
+    analysis = _analysis()
+    assert analysis.state.primary_support_need == "decision_support"
+    assert analysis.state_evidence.primary_support_need.basis == "strong_inference"
+
+
+@pytest.mark.parametrize("field", tuple(VALID_STATE))
+def test_unknown_state_requires_absent_or_ambiguous_evidence(field):
+    with pytest.raises(ValidationError, match=field):
+        _analysis(
+            state={**VALID_STATE, field: "unknown"},
+            evidence=_evidence_with(
+                field,
+                evidence="explicit dialogue evidence",
+                basis="explicit",
+            ),
+        )
+
+
+@pytest.mark.parametrize("field", tuple(VALID_STATE))
+def test_known_state_rejects_absent_or_ambiguous_evidence(field):
+    with pytest.raises(ValidationError, match=field):
+        _analysis(
+            evidence=_evidence_with(
+                field,
+                evidence="no reliable evidence",
+                basis="absent_or_ambiguous",
+            )
+        )
+
+
+@pytest.mark.parametrize("field", tuple(VALID_STATE))
+def test_known_state_requires_non_blank_evidence(field):
+    with pytest.raises(ValidationError, match=field):
+        _analysis(
+            evidence=_evidence_with(
+                field,
+                evidence=" ",
+                basis="strong_inference",
+            )
+        )
+
+
+@pytest.mark.parametrize("field", tuple(VALID_STATE))
+def test_unknown_state_accepts_absent_or_ambiguous_evidence(field):
+    analysis = _analysis(
+        state={**VALID_STATE, field: "unknown"},
+        evidence=_evidence_with(
+            field,
+            evidence="",
+            basis="absent_or_ambiguous",
         ),
-        state=_state(),
     )
-    assert analysis.state.primary_need == "被理解"
+    assert getattr(analysis.state, field) == "unknown"
 
 
-def test_planner_requires_exactly_three_distinct_strategies():
-    plan = StrategyPlanSet(
-        strategies=["Question", "Reflection of feelings", "Providing Suggestions"]
-    )
-    assert plan.strategy_for_id("S2") == "Reflection of feelings"
+@pytest.mark.parametrize(
+    "strategies",
+    [
+        ["Question"],
+        ["Question", "Reflection of feelings"],
+        ["Question", "Reflection of feelings", "Providing Suggestions"],
+    ],
+)
+def test_planner_accepts_one_to_three_distinct_strategies(strategies):
+    plan = StrategyPlanSet(strategies=strategies)
+    assert plan.strategies == strategies
+
+
+def test_planner_rejects_duplicate_or_out_of_range_strategies():
     with pytest.raises(ValidationError, match="distinct"):
         StrategyPlanSet(strategies=["Question", "Question", "Information"])
+    with pytest.raises(ValidationError):
+        StrategyPlanSet(strategies=[])
+    with pytest.raises(ValidationError):
+        StrategyPlanSet(
+            strategies=[
+                "Question",
+                "Reflection of feelings",
+                "Providing Suggestions",
+                "Information",
+            ]
+        )
 
 
 def test_plan_selection_contains_exactly_one_strategy_and_intent():

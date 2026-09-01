@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader
 from .anchors import (
     AnchorArtifact,
     AnchorEncoder,
+    masked_state_anchor_payload,
     plan_anchor_payload,
     serialize_anchor_payload,
     state_anchor_payload,
@@ -32,8 +33,6 @@ from .interventions import (
     InterventionBuilder,
     InterventionExcluded,
     StateEffectVerdict,
-    StateField,
-    mask_state_field,
     select_counterfactual_plan,
 )
 from .prompting import build_messages
@@ -55,6 +54,7 @@ from .schemas import (
     SafetyVerdict,
     STATE_ANCHOR_FIELDS,
     StateBlackboard,
+    StateField,
     TeacherTrace,
 )
 from .storage import read_jsonl, write_jsonl
@@ -64,6 +64,7 @@ from .student_data import (
     StandardSFTCollator,
     encode_generation_prompt,
 )
+from .state_guides import STATE_FIELD_GUIDES
 from .teacher import TeacherRunner
 from .trainer import StandardSFTTrainer, StageTrainer, build_paged_adamw_8bit
 from .training import length_normalized_score, response_token_log_probs
@@ -92,6 +93,8 @@ def _intervention_shape_exclusion(
             return "state_not_single_field"
         return None
     if function == "PLAN":
+        if len(trace.candidates) < 2:
+            return "plan_no_alternative"
         used = trace.final_selection.to_plan_selection()
         if used.strategies[0] not in trace.plan.strategies:
             return "plan_overlap"
@@ -265,6 +268,7 @@ def build_anchor_artifact(
         and item.function == "PLAN"
     ]
     diagnostic_ids: list[str] = []
+    diagnostic_state_payloads: list[tuple[str, dict[str, str]]] = []
     for trace in all_trace_by_id.values():
         if trace.split != "diagnostic_holdout":
             continue
@@ -280,9 +284,8 @@ def build_anchor_artifact(
             continue
         if _intervention_shape_exclusion(trace, "PLAN") is not None:
             continue
-        diagnostic_state, _ = mask_state_field(
-            trace.state,
-            diagnostic_state_field,
+        diagnostic_state = masked_state_anchor_payload(
+            trace.state, diagnostic_state_field
         )
         diagnostic_plan, _ = select_counterfactual_plan(
             candidates=trace.candidates,
@@ -290,12 +293,16 @@ def build_anchor_artifact(
             example_id=trace.example_id,
             global_seed=global_seed,
         )
-        state_mutations.append((trace.example_id, diagnostic_state))
+        diagnostic_state_payloads.append((trace.example_id, diagnostic_state))
         plan_mutations.append((trace.example_id, diagnostic_plan))
         diagnostic_ids.append(trace.example_id)
+    state_mutation_payloads = [
+        (example_id, state_anchor_payload(value))
+        for example_id, value in state_mutations
+    ] + diagnostic_state_payloads
     mutated_state_texts = [
-        serialize_anchor_payload(state_anchor_payload(value))
-        for _, value in state_mutations
+        serialize_anchor_payload(payload)
+        for _, payload in state_mutation_payloads
     ]
     mutated_plan_texts = [
         serialize_anchor_payload(plan_anchor_payload(value))
@@ -322,7 +329,7 @@ def build_anchor_artifact(
             batch_size=batch_size,
             description="encode mutated STATE anchors",
         )
-        if state_mutations
+        if state_mutation_payloads
         else None
     )
     mutated_plan = (
@@ -345,7 +352,8 @@ def build_anchor_artifact(
         mutated_state=mutated_state,
         mutated_plan=mutated_plan,
         mutated_state_to_row={
-            example_id: index for index, (example_id, _) in enumerate(state_mutations)
+            example_id: index
+            for index, (example_id, _) in enumerate(state_mutation_payloads)
         },
         mutated_plan_to_row={
             example_id: index for index, (example_id, _) in enumerate(plan_mutations)
@@ -426,18 +434,32 @@ def _verify_intervention_effect(
     return EffectVerification(passed=True)
 
 
-_AUXILIARY_DIMENSION_ORDER = (
-    "emotion",
-    "need",
-    "relationship",
-    "intent",
-    "specificity",
-    "timing",
-    "effectiveness",
-    "autonomy",
-    "factuality",
-    "non_template",
-)
+def _combine_state_effect_verdicts(
+    first: StateEffectVerdict,
+    second: StateEffectVerdict,
+) -> EffectVerification:
+    first_fields = set(first.affected_non_target_fields)
+    second_fields = set(second.affected_non_target_fields)
+    if (
+        first.condition_a_fit != second.condition_b_fit
+        or first.condition_b_fit != second.condition_a_fit
+        or first.target_effect_present != second.target_effect_present
+        or first.localized_effect != second.localized_effect
+        or first_fields != second_fields
+    ):
+        return EffectVerification(
+            passed=False,
+            reason="bidirectional_disagreement",
+        )
+    if (
+        not first.condition_a_fit
+        or not first.condition_b_fit
+        or not first.target_effect_present
+    ):
+        return EffectVerification(passed=False, reason="no_localized_effect")
+    if not first.localized_effect or first_fields:
+        return EffectVerification(passed=False, reason="non_localized_effect")
+    return EffectVerification(passed=True)
 
 
 def _verify_state_intervention_effect(
@@ -464,6 +486,14 @@ def _verify_state_intervention_effect(
         "target_value": mutated_payload[target_field],
         "response": counterfactual_response,
     }
+    target_guide = STATE_FIELD_GUIDES[target_field]
+    verification_context = {
+        "target_field": target_field,
+        "target_field_definition": target_guide.definition,
+        "permitted_local_effects": list(target_guide.permitted_local_effects),
+        "prohibited_local_effects": list(target_guide.prohibited_local_effects),
+        "unchanged_state": unchanged_state,
+    }
     first, _ = caller.call(
         "state_effect_verifier",
         build_messages(
@@ -471,8 +501,7 @@ def _verify_state_intervention_effect(
             trace.history,
             StateEffectVerdict,
             context={
-                "target_field": target_field,
-                "unchanged_state": unchanged_state,
+                **verification_context,
                 "condition_A": condition_original,
                 "condition_B": condition_counterfactual,
             },
@@ -487,8 +516,7 @@ def _verify_state_intervention_effect(
             trace.history,
             StateEffectVerdict,
             context={
-                "target_field": target_field,
-                "unchanged_state": unchanged_state,
+                **verification_context,
                 "condition_A": condition_counterfactual,
                 "condition_B": condition_original,
             },
@@ -496,32 +524,7 @@ def _verify_state_intervention_effect(
         StateEffectVerdict,
         example_id=f"{trace.example_id}:effect:STATE:{target_field}:ba",
     )
-    if (
-        first.condition_a_fit != second.condition_b_fit
-        or first.condition_b_fit != second.condition_a_fit
-        or first.field_effect_present != second.field_effect_present
-    ):
-        return EffectVerification(
-            passed=False,
-            reason="bidirectional_disagreement",
-        )
-    if (
-        not first.condition_a_fit
-        or not first.condition_b_fit
-        or not first.field_effect_present
-        or not second.field_effect_present
-    ):
-        return EffectVerification(passed=False, reason="no_localized_effect")
-    dimensions = set(first.affected_dimensions) | set(second.affected_dimensions)
-    affected_dimensions = tuple(
-        dimension
-        for dimension in _AUXILIARY_DIMENSION_ORDER
-        if dimension in dimensions
-    )
-    return EffectVerification(
-        passed=True,
-        affected_dimensions=affected_dimensions,
-    )
+    return _combine_state_effect_verdicts(first, second)
 
 
 def _verify_intervention_safety(
@@ -581,14 +584,7 @@ def _command_build_interventions(args: Namespace) -> int:
             state_attempt_index += 1
         else:
             original_plan = trace.final_selection.to_plan_selection()
-            counterfactual_plan, _ = select_counterfactual_plan(
-                candidates=trace.candidates,
-                selected_candidate_id=trace.final_selection.selected_candidate_id,
-                example_id=trace.example_id,
-                global_seed=args.global_seed,
-            )
             original_plan_categories = list(original_plan.strategies)
-            counterfactual_plan_categories = list(counterfactual_plan.strategies)
         audit_entry: dict[str, Any] = {
             "example_id": trace.example_id,
             "eligibility": "eligible",
@@ -603,7 +599,7 @@ def _command_build_interventions(args: Namespace) -> int:
                 "localized_effect": False,
                 "conditional_correspondence_verified": False,
                 "bidirectional_verified": False,
-                "affected_dimensions": [],
+                "affected_non_target_fields": [],
             },
             "exclusion_reason": None,
         }
@@ -618,6 +614,17 @@ def _command_build_interventions(args: Namespace) -> int:
             audit_entry["exclusion_reason"] = shape_exclusion
             intervention_audit.append(audit_entry)
             continue
+        if function == "PLAN":
+            counterfactual_plan, _ = select_counterfactual_plan(
+                candidates=trace.candidates,
+                selected_candidate_id=trace.final_selection.selected_candidate_id,
+                example_id=trace.example_id,
+                global_seed=args.global_seed,
+            )
+            counterfactual_plan_categories = list(counterfactual_plan.strategies)
+            audit_entry["counterfactual_plan_categories"] = (
+                counterfactual_plan_categories
+            )
         builder = InterventionBuilder(
             runner,
             verify_safety=(
@@ -676,7 +683,9 @@ def _command_build_interventions(args: Namespace) -> int:
                             record.conditional_correspondence_verified
                         ),
                         "bidirectional_verified": record.bidirectional_verified,
-                        "affected_dimensions": list(record.affected_dimensions),
+                        "affected_non_target_fields": list(
+                            record.affected_non_target_fields
+                        ),
                     },
                 }
             )
@@ -1666,3 +1675,4 @@ def run_pipeline_command(args: Namespace) -> int:
     if args.command == "generate":
         return _command_generate(args)
     raise ValueError(f"unknown pipeline command {args.command}")
+    masked_state_anchor_payload,

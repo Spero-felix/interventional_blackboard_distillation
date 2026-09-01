@@ -270,6 +270,9 @@ class StructuredCaller:
                     raw_text=result.text,
                     parsed=parsed.model_dump(mode="json"),
                     schema_retry=index > 0,
+                    metadata_fallback=bool(
+                        getattr(self.backend, "fallback_used", False)
+                    ),
                 )
             )
             if cache_key is not None:

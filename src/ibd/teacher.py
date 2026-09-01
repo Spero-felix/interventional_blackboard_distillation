@@ -8,6 +8,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from pydantic import create_model
+
 from .backend import LLMBackend, LLMResult, StructuredCaller
 from .config import AppConfig, ModelConfig
 from .prompting import build_messages
@@ -18,15 +20,15 @@ from .schemas import (
     FinalSelectionDecision,
     History,
     MultiViewStateAnalysis,
-    NonSafetyDimension,
     PlanSelection,
+    StateField,
     StateBlackboard,
-    StateCounterfactual,
     StrictModel,
     StrategyName,
     StrategyPlanSet,
     TeacherTrace,
 )
+from .state_guides import counterfactual_context
 
 NORMAL_ROLES = (
     "multi_view_state_analyzer",
@@ -53,10 +55,12 @@ def _single_fenced_payload(text: str) -> object | None:
         return None
 
 
-@dataclass(frozen=True)
+@dataclass
 class _PlainTextCandidateBackend:
     backend: LLMBackend
     fixed_fields: dict[str, Any]
+    plain_text_attempts: int = 0
+    fallback_used: bool = False
 
     def complete(
         self,
@@ -89,7 +93,11 @@ class _PlainTextCandidateBackend:
             return result
         if "```" in result.text or result.text.lstrip().startswith(("{", "[")):
             return result
+        self.plain_text_attempts += 1
+        if self.plain_text_attempts == 1:
+            return result
         response = payload if isinstance(payload, str) else result.text
+        self.fallback_used = True
         return LLMResult(
             text=json.dumps(
                 {
@@ -191,26 +199,39 @@ class TeacherRunner:
         self,
         history: History,
         state: StateBlackboard,
-        target_field: str,
-        target_dimension: NonSafetyDimension,
+        target_field: StateField,
         *,
         example_id: str,
     ) -> str:
         records: list[CallRecord] = []
+        target_context = counterfactual_context(
+            target_field, getattr(state, target_field)
+        )
+        allowed_replacements = tuple(target_context["allowed_replacements"])
+        replacement_type = Literal.__getitem__(allowed_replacements)
+        response_model = create_model(
+            f"{target_field.title().replace('_', '')}Counterfactual",
+            __base__=StrictModel,
+            replacement=(replacement_type, ...),
+        )
         result = self._call(
             "state_counterfactual_generator",
             history,
-            StateCounterfactual,
+            response_model,
             records,
             context={
                 "state": state,
-                "target_field": target_field,
-                "target_dimension": target_dimension,
-                "original_value": getattr(state, target_field),
+                **target_context,
             },
             example_id=example_id,
         )
-        return result.replacement
+        replacement = result.replacement
+        if replacement not in target_context["allowed_replacements"]:
+            raise ValueError(
+                f"STATE counterfactual replacement {replacement!r} is not allowed "
+                f"for {target_field}"
+            )
+        return replacement
 
     def _run_from_state(
         self,
@@ -237,12 +258,12 @@ class TeacherRunner:
                 example_id=example_id,
                 history=history,
                 state=state,
-                strategy=plan.strategy_for_id(f"S{index}"),
+                strategy=strategy,
                 local_index=index,
                 records=records,
                 clamped_state_field=clamped_state_field,
             )
-            for index in range(1, 4)
+            for index, strategy in enumerate(plan.strategies, start=1)
         ]
         final_selection = self._run_final_selector(
             history=history,

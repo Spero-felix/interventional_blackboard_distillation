@@ -3,7 +3,7 @@ import random
 import pytest
 from pydantic import ValidationError
 
-from conftest import ScriptedBackend
+from conftest import ScriptedBackend, VALID_STATE
 from ibd.interventions import (
     ConditionalEffectVerdict,
     EffectVerification,
@@ -13,14 +13,20 @@ from ibd.interventions import (
     replace_state_field,
     select_counterfactual_plan,
 )
-from ibd.schemas import STATE_ANCHOR_FIELDS
+from ibd.schemas import STATE_ANCHOR_FIELDS, StateBlackboard
+from ibd.state_guides import STATE_FIELD_GUIDES
 from ibd.teacher import TeacherRunner
+from ibd.pipeline import _combine_state_effect_verdicts
 
 
 @pytest.mark.parametrize("field", STATE_ANCHOR_FIELDS)
 def test_state_counterfactual_changes_exactly_one_field(history, app_config, field):
     trace = TeacherRunner(ScriptedBackend(), app_config).run("e-state", history)
-    replacement = "一个不同且有效的值"
+    replacement = next(
+        value
+        for value in STATE_FIELD_GUIDES[field].values
+        if value not in {getattr(trace.state, field), "unknown"}
+    )
     mutated, mutation = replace_state_field(trace.state, field, replacement)
     changed = {
         key
@@ -37,7 +43,31 @@ def test_state_counterfactual_rejects_invalid_replacement(
 ):
     trace = TeacherRunner(ScriptedBackend(), app_config).run("e-state", history)
     with pytest.raises(ValueError):
-        replace_state_field(trace.state, "emotion", replacement)
+        replace_state_field(trace.state, "dominant_emotion", replacement)
+
+
+def test_state_counterfactual_context_uses_target_enum(history, app_config):
+    backend = ScriptedBackend()
+    replacement = TeacherRunner(backend, app_config).generate_state_counterfactual(
+        history,
+        StateBlackboard(**VALID_STATE),
+        "advice_receptivity",
+        example_id="cf",
+    )
+
+    assert replacement in {"closed", "open", "requested"}
+    payload = __import__("json").loads(backend.calls[-1]["messages"][1]["content"])
+    context = payload["context"]
+    assert context["allowed_replacements"] == ["closed", "open", "requested"]
+    assert context["target_field_definition"]
+    schema = __import__("json").loads(
+        backend.calls[-1]["messages"][0]["content"].split("JSON Schema:\n", 1)[1]
+    )
+    assert schema["properties"]["replacement"]["enum"] == [
+        "closed",
+        "open",
+        "requested",
+    ]
 
 
 def test_plan_counterfactual_reuses_one_unselected_candidate_deterministically(
@@ -81,19 +111,44 @@ def test_plan_intervention_makes_no_new_model_call(history, app_config):
     assert record.conditioning_contract == "legacy_joint_downstream_v1"
 
 
+def test_plan_intervention_skips_trace_without_an_alternative(history, app_config):
+    class OnePlanBackend(ScriptedBackend):
+        def _payload(self, role, seed):
+            if role == "planner":
+                return {"strategies": ["Others"]}
+            if role == "final_selector":
+                return {
+                    "selected_candidate_id": "1",
+                    "response_goal": "close the interaction",
+                    "response_act": "offer a brief farewell",
+                }
+            return super()._payload(role, seed)
+
+    trace = TeacherRunner(OnePlanBackend(), app_config).run("e-one-plan", history)
+    builder = InterventionBuilder(
+        TeacherRunner(ScriptedBackend(), app_config),
+        verify_safety=lambda *args: True,
+        verify_state_effect=lambda *args: EffectVerification(passed=True),
+        verify_plan_effect=lambda *args: EffectVerification(passed=True),
+    )
+
+    with pytest.raises(InterventionExcluded) as caught:
+        builder.build(trace, "PLAN", global_seed=17)
+
+    assert caught.value.reason == "plan_no_alternative"
+
+
 def test_state_intervention_reruns_planner_candidates_and_selector(history, app_config):
     trace = TeacherRunner(ScriptedBackend(), app_config).run("e-state", history)
     backend = ScriptedBackend()
     builder = InterventionBuilder(
         TeacherRunner(backend, app_config),
         verify_safety=lambda original, counterfactual: True,
-        verify_state_effect=lambda *args: EffectVerification(
-            passed=True, affected_dimensions=("timing",)
-        ),
+        verify_state_effect=lambda *args: EffectVerification(passed=True),
         verify_plan_effect=lambda *args: EffectVerification(passed=True),
     )
     record = builder.build(
-        trace, "STATE", state_field="readiness", global_seed=17
+        trace, "STATE", state_field="advice_receptivity", global_seed=17
     )
     assert [call["role"] for call in backend.calls] == [
         "state_counterfactual_generator",
@@ -103,8 +158,8 @@ def test_state_intervention_reruns_planner_candidates_and_selector(history, app_
         "candidate",
         "final_selector",
     ]
-    assert record.mutated_state.readiness == "准备立即采取具体行动"
-    assert record.affected_dimensions == ["timing"]
+    assert record.mutated_state.advice_receptivity == "closed"
+    assert record.affected_non_target_fields == []
     assert record.conditioning_contract == "legacy_joint_downstream_v1"
 
 
@@ -121,7 +176,7 @@ def test_b2_state_intervention_fixes_the_original_plan(history, app_config):
     record = builder.build(
         trace,
         "STATE",
-        state_field="readiness",
+        state_field="advice_receptivity",
         global_seed=17,
         state_plan_policy="fixed_original",
     )
@@ -131,7 +186,7 @@ def test_b2_state_intervention_fixes_the_original_plan(history, app_config):
         "candidate",
     ]
     candidate_payload = __import__("json").loads(backend.calls[-1]["messages"][1]["content"])
-    assert candidate_payload["context"]["state"]["readiness"] == "准备立即采取具体行动"
+    assert candidate_payload["context"]["state"]["advice_receptivity"] == "closed"
     assert candidate_payload["context"]["fixed_plan"] == trace.final_selection.to_plan_selection().model_dump(mode="json")
     assert record.counterfactual_response == "候选回复-1"
     assert record.conditioning_contract == "single_variable_v1"
@@ -191,7 +246,8 @@ def test_verifier_contracts_have_no_preference_direction():
     state = StateEffectVerdict(
         condition_a_fit=True,
         condition_b_fit=True,
-        field_effect_present=True,
+        target_effect_present=True,
+        localized_effect=True,
         evidence="localized",
     )
     assert "preferred" not in plan.model_dump()
@@ -204,3 +260,42 @@ def test_verifier_contracts_have_no_preference_direction():
             evidence="x",
             preferred="A",
         )
+
+
+def test_state_effect_verdict_records_non_target_fields():
+    verdict = StateEffectVerdict(
+        condition_a_fit=True,
+        condition_b_fit=True,
+        target_effect_present=True,
+        localized_effect=False,
+        affected_non_target_fields=["action_capacity"],
+        evidence="Advice posture changed, but step burden also changed.",
+    )
+
+    assert verdict.affected_non_target_fields == ["action_capacity"]
+
+
+def test_state_effect_rejects_non_local_change():
+    verdicts = [
+        StateEffectVerdict(
+            condition_a_fit=True,
+            condition_b_fit=True,
+            target_effect_present=True,
+            localized_effect=False,
+            affected_non_target_fields=["action_capacity"],
+            evidence="Changing advice posture also changed step burden.",
+        ),
+        StateEffectVerdict(
+            condition_a_fit=True,
+            condition_b_fit=True,
+            target_effect_present=True,
+            localized_effect=False,
+            affected_non_target_fields=["action_capacity"],
+            evidence="The swapped bundles show the same capacity effect.",
+        ),
+    ]
+
+    result = _combine_state_effect_verdicts(*verdicts)
+
+    assert result.passed is False
+    assert result.reason == "non_localized_effect"

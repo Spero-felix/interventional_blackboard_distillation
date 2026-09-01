@@ -6,18 +6,18 @@
 
 ## Teacher 架构
 
-正常轨迹固定为 6 个逻辑调用：
+正常轨迹由一次状态分析、一次规划、按需候选生成和一次最终选择组成：
 
 ```text
 对话历史 H
-  → Multi-view State Analyzer（一次调用，输出四个审计视角 + STATE）
-  → Planner（生成三个不同策略）
-  → Candidate 1 / 2 / 3（每个候选只执行一个策略）
+  → 七维 State Analyzer（一次调用，输出四个审计视角 + STATE）
+  → Planner（选择 1–3 个确实适用的不同策略）
+  → Candidate 1 / 2 / 3（每个已选策略各生成一个单策略候选）
   → Final Selector（只选择一个候选 ID）
   → 控制器原样返回该候选回复
 ```
 
-最终选择器不能合并或重写候选。模型只输出 `selected_candidate_id` 以及简短的 `response_goal`、`response_act`；最终策略、策略 ID 和回复文本由控制器从候选表中重新构造。因此最终答案最多包含一个策略，中间仍保留三个策略与三个回复用于比较。
+最终选择器不能合并或重写候选。模型只输出 `selected_candidate_id` 以及简短的 `response_goal`、`response_act`；最终策略、策略 ID 和回复文本由控制器从候选表中重新构造。因此最终答案最多包含一个策略，中间保留 1–3 个由当前对话实际支持的备选。若 Planner 只返回一个候选，该轨迹仍可用于自然回复训练，但因没有替代策略而不能构造 PLAN 干预。
 
 正常 Teacher 路径不再运行情绪、有效性、安全三个多维 critic，也不再构造 critique-grounded Stage D。训练数据离线构造阶段保留两个窄功能组件：
 
@@ -68,7 +68,7 @@ Stage C 不验证“换成反事实后回复应该变差”，而是验证“换
 反事实 anchor clamp：   score(y_counterfactual) > score(y_original)
 ```
 
-训练使用 teacher-forced、长度归一化的回复分数和双向 hinge loss。只钳制被干预的目标槽，另一个槽保持由当前上下文自然计算。PLAN 反事实直接从原先未被最终选择的两个候选中按 `example_id + global_seed` 确定性选择一个，不额外生成回复；STATE 反事实只替换一个字段，然后重新运行 Planner、三个 Candidate 和 Final Selector。
+训练使用 teacher-forced、长度归一化的回复分数和双向 hinge loss。只钳制被干预的目标槽，另一个槽保持由当前上下文自然计算。PLAN 反事实从原先未被最终选择的候选中按 `example_id + global_seed` 确定性选择一个，不额外生成回复；STATE 反事实只替换一个合法枚举字段，然后重新运行 Planner、对应数量的 Candidate 和 Final Selector。
 
 自然无 clamp 的 SFT 始终以 `y_original` 为目标。`y_counterfactual` 不是 rejected、negative 或 degraded response，而是 **counterfactual-conditioned response**。
 
@@ -108,6 +108,9 @@ $PY -m ibd.cli run-teacher \
   --input artifacts/socialsim/prepared.json \
   --output artifacts/teacher/traces.jsonl
 
+# policy-neutral-v1 使用新的缓存命名空间和数据契约。Teacher trace、
+# intervention 与 anchor 必须写入新的 artifact 目录，不能与旧协议混用。
+
 $PY -m ibd.cli build-interventions \
   --config configs/deepseek_teacher.yaml \
   --input artifacts/teacher/traces.jsonl \
@@ -120,7 +123,7 @@ CUDA_VISIBLE_DEVICES=0 $PY -m ibd.cli precompute-anchors \
   --traces artifacts/teacher/traces.jsonl \
   --interventions artifacts/student/interventions.jsonl \
   --output artifacts/student/anchors.safetensors \
-  --diagnostic-state-field readiness \
+  --diagnostic-state-field advice_receptivity \
   --global-seed 42
 
 CUDA_VISIBLE_DEVICES=0 $PY -m ibd.cli train-pipeline \
@@ -145,7 +148,7 @@ CUDA_VISIBLE_DEVICES=0 $PY -m ibd.cli precompute-anchors \
   --traces artifacts/teacher/traces.jsonl \
   --interventions artifacts/b2/interventions-single-variable.jsonl \
   --output artifacts/b2/anchors.safetensors \
-  --diagnostic-state-field readiness \
+  --diagnostic-state-field advice_receptivity \
   --original-splits train dev \
   --global-seed 42
 
@@ -211,7 +214,7 @@ CUDA_VISIBLE_DEVICES=0 $PY -m ibd.cli train-sft-control \
 保留原有 response-only SFT 对照。数据格式必须严格为：
 
 ```text
-[emotion]…[intensity]…[primary_need]…[support_goal]…[readiness]…[main_constraint]…[relationship_context]…[selected_strategy]…[response]…
+[dominant_emotion]…[distress_level]…[primary_support_need]…[advice_receptivity]…[action_intent]…[action_capacity]…[continuation_intent]…[selected_strategy]…[response]…
 ```
 
 `train-pipeline` 的自动主链保持 A、B、C；B2 只能通过 `train --stage B2`
@@ -354,7 +357,7 @@ docs/superpowers/plans/  实施计划
 
 ## 固定第一个 PLAN 候选的 2000 条实验
 
-这组实验不重新生成 Teacher 的 STATE、PLAN 或三个候选，而是从现有 2000 条
+这组历史实验不重新生成 Teacher 的 STATE、PLAN 或已有候选，而是从现有 2000 条
 完整轨迹中固定选择 `strategy_id == "S1"` 的候选，重建每条轨迹的
 `final_selection` 和 `final_response`。原始 `train/dev/diagnostic_holdout` 划分
 保持为 `1500/200/300`，旧数据和旧 artifact 不会被覆盖。
@@ -399,7 +402,7 @@ CUDA_VISIBLE_DEVICES=0 $PY -m ibd.cli precompute-anchors \
   --interventions artifacts/full-2000-first-plan/interventions.jsonl \
   --output artifacts/full-2000-first-plan/anchors-train-dev.safetensors \
   --original-splits train dev \
-  --diagnostic-state-field readiness \
+  --diagnostic-state-field advice_receptivity \
   --global-seed 42
 ```
 
