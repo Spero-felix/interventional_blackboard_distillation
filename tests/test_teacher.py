@@ -16,6 +16,13 @@ from ibd.schemas import (
 from ibd.teacher import NORMAL_ROLES, TeacherRunner, _PlainTextCandidateBackend
 
 
+UNKNOWN_STATE_POLICY = (
+    "unknown means no usable evidence for that field. It must not be "
+    "interpreted as any direction, preference, boundary, or default support "
+    "action, and it must not count for or against a strategy or candidate."
+)
+
+
 class FixedTextBackend:
     def __init__(self, text):
         self.text = text
@@ -105,6 +112,36 @@ def test_analyzer_prompt_uses_seven_state_guide(history):
     assert "advice_receptivity" in prompt
     assert "unknown as a middle or low value" in prompt
     assert "at most 20 words" not in prompt
+
+
+@pytest.mark.parametrize(
+    ("role", "response_model", "context"),
+    [
+        ("multi_view_state_analyzer", MultiViewStateAnalysis, {}),
+        ("planner", StrategyPlanSet, {"state": VALID_STATE}),
+        (
+            "candidate",
+            Candidate,
+            {
+                "state": VALID_STATE,
+                "candidate_id": "1",
+                "strategy_id": "S1",
+                "strategy": "Question",
+            },
+        ),
+        (
+            "final_selector",
+            FinalSelectionDecision,
+            {"state": VALID_STATE, "candidates": []},
+        ),
+    ],
+)
+def test_state_consuming_prompts_include_unknown_state_policy(
+    history, role, response_model, context
+):
+    prompt = build_messages(role, history, response_model, context=context)[0]["content"]
+
+    assert UNKNOWN_STATE_POLICY in prompt
 
 
 def test_planner_prompt_allows_only_meaningful_one_to_three_options(history):

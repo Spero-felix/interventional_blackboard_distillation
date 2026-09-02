@@ -54,6 +54,18 @@ _SECTIONS = (
     "Role", "Objective", "Available Inputs", "Responsibilities", "Procedure",
     "Constraints", "Quality Criteria", "Output Contract",
 )
+_UNKNOWN_STATE_POLICY = (
+    "A known STATE value may affect only the local response effects assigned to "
+    "that field. unknown means no usable evidence for that field. It must not be "
+    "interpreted as any direction, preference, boundary, or default support action, "
+    "and it must not count for or against a strategy or candidate."
+)
+_STATE_CONSUMING_ROLES = {
+    "multi_view_state_analyzer",
+    "planner",
+    "candidate",
+    "final_selector",
+}
 
 
 def _prompt(**sections: str) -> str:
@@ -310,6 +322,8 @@ def _jsonable(value: Any) -> Any:
 
 def _resolved_prompt(role: str, context: dict[str, Any]) -> str:
     prompt = _ROLE_PROMPTS[role]
+    if role in _STATE_CONSUMING_ROLES:
+        prompt += f"\n\n# Unknown STATE Handling\n{_UNKNOWN_STATE_POLICY}"
     if role == "multi_view_state_analyzer":
         prompt += f"\n\n# STATE Label Guide\n{render_state_label_guide()}"
     elif role == "planner":
