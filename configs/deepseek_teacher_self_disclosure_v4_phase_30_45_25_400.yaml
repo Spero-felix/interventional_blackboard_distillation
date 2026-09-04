@@ -1,10 +1,10 @@
-protocol_version: qwen25-socialsim-seven-state-policy-neutral-v2-synthetic-self-disclosure
+protocol_version: qwen25-socialsim-seven-state-policy-neutral-v4-self-disclosure-phase-2500-20-55-25
 
 backend:
   base_url_env: OPENAI_BASE_URL
   api_key_env: OPENAI_API_KEY
   timeout_seconds: 120
-  cache_dir: cache/teacher-phase-balanced-v4-seed42
+  cache_dir: cache/2500-20-55-25
 
 default_model:
   model: deepseek-v4-pro
@@ -15,7 +15,7 @@ default_model:
 roles:
   multi_view_state_analyzer:
     model: deepseek-v4-flash
-    temperature: 0.3
+    temperature: 0.0
     max_tokens: 1400
     provider_json_mode: true
     thinking_enabled: false

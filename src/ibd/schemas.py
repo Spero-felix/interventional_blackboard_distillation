@@ -40,7 +40,6 @@ DominantEmotion = Literal[
 ]
 DistressLevel = Literal["low", "moderate", "high", "unknown"]
 PrimarySupportNeed = Literal[
-    "emotional_expression",
     "validation",
     "esteem_support",
     "sensemaking",

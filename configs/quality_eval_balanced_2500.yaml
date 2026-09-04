@@ -1,0 +1,48 @@
+protocol_version: generation-quality-v1
+splits: [diagnostic_holdout]
+
+models:
+  - model_id: teacher
+    source: teacher_trace
+  - model_id: base
+    source: base_qwen
+    training_config: experiments/balanced-ab-2500-a1-b5-lr-8e-5-1500.yaml
+  - model_id: balanced-b-2500
+    source: student_checkpoint
+    training_config: ../runs/balanced-ab-2500-a1-b5-lr-8e-5-1500/training_config.yaml
+    checkpoint: ../runs/balanced-ab-2500-a1-b5-lr-8e-5-1500/stage-B-step-500
+    run_name: balanced-ab-2500-a1-b5-lr-8e-5-1500
+  - model_id: balanced-standard-sft-2500
+    source: standard_sft_checkpoint
+    training_config: ../runs/balanced-standard-sft-2500-lr-8e-5-1500/training_config.yaml
+    checkpoint: ../runs/balanced-standard-sft-2500-lr-8e-5-1500/stage-SFT-step-250
+    run_name: balanced-standard-sft-2500-lr-8e-5-1500
+  - model_id: balanced-visible-sft-2500
+    source: visible_sft_checkpoint
+    training_config: ../runs/balanced-visible-sft-2500-lr-8e-5-1500/training_config.yaml
+    checkpoint: ../runs/balanced-visible-sft-2500-lr-8e-5-1500/stage-SFT-step-500
+    run_name: balanced-visible-sft-2500-lr-8e-5-1500
+
+generation:
+  max_new_tokens: 256
+  do_sample: false
+  seed: 42
+
+backend:
+  base_url_env: OPENAI_BASE_URL
+  api_key_env: OPENAI_API_KEY
+  timeout_seconds: 60
+
+judge:
+  model: deepseek-v4-pro
+  temperature: 0.0
+  max_tokens: 1200
+  supports_seed: false
+  provider_json_mode: true
+  thinking_enabled: false
+
+judge_seed: 4242
+judge_prompt_version: quality-judge-v1
+human_seed: 2026
+schema_retries: 1
+teacher_model: deepseek-v4-flash

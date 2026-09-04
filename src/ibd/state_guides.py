@@ -64,7 +64,6 @@ STATE_FIELD_GUIDES: dict[StateField, StateFieldGuide] = {
             "need; use unknown when no single need is supported."
         ),
         values={
-            "emotional_expression": "The seeker primarily needs room to express an experience or feeling and be heard.",
             "validation": "The seeker primarily needs confirmation that a feeling or reaction is understandable.",
             "esteem_support": "The seeker primarily needs support for confidence, dignity, competence, or self-worth.",
             "sensemaking": "The seeker primarily wants to understand a reaction, problem structure, or meaning.",

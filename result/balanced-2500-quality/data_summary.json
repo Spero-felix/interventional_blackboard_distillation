@@ -1,0 +1,153 @@
+{
+  "source": {
+    "report": "artifacts/quality/balanced-2500-best-holdout/judge/quality_report.json",
+    "judgments": "artifacts/quality/balanced-2500-best-holdout/judge/judgments.jsonl",
+    "responses": "artifacts/quality/balanced-2500-best-holdout/generation/responses.jsonl",
+    "split": "diagnostic_holdout"
+  },
+  "note": "Fixed single-judge evaluation. Values are descriptive holdout results, not human-preference estimates.",
+  "models": [
+    {
+      "model_id": "balanced-b-2500",
+      "label": "Stage B",
+      "coherence": 4.5267,
+      "effectiveness": 3.77,
+      "empathy": 3.62,
+      "non_coerciveness": 4.7867,
+      "overall": 4.1327,
+      "relevance": 3.96,
+      "coverage": {
+        "actual": 300,
+        "expected": 300
+      },
+      "mean_response_words": 18.186666666666667
+    },
+    {
+      "model_id": "balanced-visible-sft-2500",
+      "label": "Visible SFT",
+      "coherence": 4.4649,
+      "effectiveness": 3.612,
+      "empathy": 3.4582,
+      "non_coerciveness": 4.6455,
+      "overall": 4.0094,
+      "relevance": 3.8662,
+      "coverage": {
+        "actual": 299,
+        "expected": 300
+      },
+      "mean_response_words": 20.05016722408027
+    },
+    {
+      "model_id": "teacher",
+      "label": "Teacher",
+      "coherence": 4.4467,
+      "effectiveness": 3.6133,
+      "empathy": 3.46,
+      "non_coerciveness": 4.6333,
+      "overall": 4.002,
+      "relevance": 3.8567,
+      "coverage": {
+        "actual": 300,
+        "expected": 300
+      },
+      "mean_response_words": 19.503333333333334
+    },
+    {
+      "model_id": "balanced-standard-sft-2500",
+      "label": "Standard SFT",
+      "coherence": 4.3967,
+      "effectiveness": 3.5833,
+      "empathy": 3.46,
+      "non_coerciveness": 4.6233,
+      "overall": 3.9987,
+      "relevance": 3.93,
+      "coverage": {
+        "actual": 300,
+        "expected": 300
+      },
+      "mean_response_words": 17.303333333333335
+    },
+    {
+      "model_id": "balanced-a-2500",
+      "label": "Stage A",
+      "coherence": 4.4267,
+      "effectiveness": 3.5367,
+      "empathy": 3.4567,
+      "non_coerciveness": 4.6133,
+      "overall": 3.9947,
+      "relevance": 3.94,
+      "coverage": {
+        "actual": 300,
+        "expected": 300
+      },
+      "mean_response_words": 16.84
+    },
+    {
+      "model_id": "base",
+      "label": "Base Qwen",
+      "coherence": 4.0967,
+      "effectiveness": 3.26,
+      "empathy": 3.3133,
+      "non_coerciveness": 4.2633,
+      "overall": 3.726,
+      "relevance": 3.6967,
+      "coverage": {
+        "actual": 300,
+        "expected": 300
+      },
+      "mean_response_words": 41.28333333333333
+    }
+  ],
+  "stage_b_pairwise": [
+    {
+      "target": "teacher",
+      "n": 300,
+      "delta": 0.13066666666666668,
+      "low": 0.07086000710203756,
+      "high": 0.19047332623129581,
+      "wins": 112,
+      "ties": 100,
+      "losses": 88
+    },
+    {
+      "target": "balanced-visible-sft-2500",
+      "n": 299,
+      "delta": 0.12173913043478263,
+      "low": 0.06223326060196645,
+      "high": 0.18124500026759882,
+      "wins": 103,
+      "ties": 114,
+      "losses": 82
+    },
+    {
+      "target": "balanced-standard-sft-2500",
+      "n": 300,
+      "delta": 0.1340000000000001,
+      "low": 0.08622554416740758,
+      "high": 0.1817744558325926,
+      "wins": 116,
+      "ties": 120,
+      "losses": 64
+    },
+    {
+      "target": "balanced-a-2500",
+      "n": 300,
+      "delta": 0.13799999999999998,
+      "low": 0.0920191136990953,
+      "high": 0.18398088630090467,
+      "wins": 117,
+      "ties": 123,
+      "losses": 60
+    },
+    {
+      "target": "base",
+      "n": 300,
+      "delta": 0.40666666666666645,
+      "low": 0.35567748484394474,
+      "high": 0.4576558484893882,
+      "wins": 216,
+      "ties": 54,
+      "losses": 30
+    }
+  ]
+}
