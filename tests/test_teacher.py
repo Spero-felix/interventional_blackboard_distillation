@@ -284,56 +284,12 @@ def test_selector_rejects_unknown_candidate_id(history, app_config):
         TeacherRunner(UnknownIdBackend(), app_config).run("e-bad", history)
 
 
-def test_state_counterfactual_generator_is_a_single_local_call(history, app_config):
-    backend = ScriptedBackend()
-    runner = TeacherRunner(backend, app_config)
-    trace = runner.run("e-base", history)
-    backend.calls.clear()
-    replacement = runner.generate_state_counterfactual(
-        history,
-        trace.state,
-        "advice_receptivity",
-        example_id="e-base:cf",
-    )
-    assert replacement in {"closed", "open", "requested"}
-    assert [call["role"] for call in backend.calls] == [
-        "state_counterfactual_generator"
-    ]
-
-
-def test_fixed_plan_response_uses_the_plan_as_an_authoritative_candidate_condition(
-    history, app_config
-):
-    backend = ScriptedBackend()
-    runner = TeacherRunner(backend, app_config)
-    trace = runner.run("e-base", history)
-    backend.calls.clear()
-
-    response = runner.generate_response_under_fixed_plan(
-        history,
-        trace.state,
-        trace.final_selection.to_plan_selection(),
-        clamped_state_field="advice_receptivity",
-        example_id="e-base:fixed-plan",
-    )
-
-    assert response == "候选回复-1"
-    assert [call["role"] for call in backend.calls] == ["candidate"]
-    system_prompt = backend.calls[0]["messages"][0]["content"]
-    assert "Experimental PLAN Clamp" in system_prompt
-    assert "without replanning" in system_prompt
-
-
 def test_prompt_registry_contains_only_current_roles():
     assert set(PROMPT_ROLES) == {
         "multi_view_state_analyzer",
         "planner",
         "candidate",
         "final_selector",
-        "state_counterfactual_generator",
-        "condition_effect_verifier",
-        "state_effect_verifier",
-        "safety_verifier",
     }
 
 
@@ -341,10 +297,7 @@ def test_teacher_configs_use_synthetic_self_disclosure_protocol():
     from ibd.config import AppConfig
 
     repository = Path(__file__).parents[1]
-    for relative_path in (
-        "configs/deepseek_teacher.yaml",
-        "configs/deepseek_teacher_phase_balanced_v4.yaml",
-    ):
+    for relative_path in ("configs/deepseek_teacher.yaml",):
         config = AppConfig.from_yaml(repository / relative_path)
         assert (
             config.protocol_version

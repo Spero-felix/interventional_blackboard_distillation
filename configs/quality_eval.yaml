@@ -12,11 +12,6 @@ models:
     training_config: ../runs/ab2000-lr-8e-5/training_config.yaml
     checkpoint: ../runs/ab2000-lr-8e-5/stage-B-step-752
     run_name: ab2000-lr-8e-5
-  - model_id: ibd-c-8e-5
-    source: student_checkpoint
-    training_config: ../runs/ab2000-lr-8e-5/training_config-stage-C.yaml
-    checkpoint: ../runs/ab2000-lr-8e-5/stage-C-step-897
-    run_name: ab2000-lr-8e-5
   - model_id: standard-sft-8e-5
     source: standard_sft_checkpoint
     training_config: ../runs/sft-control-lr-8e-5/training_config.yaml

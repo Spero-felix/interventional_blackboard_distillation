@@ -120,28 +120,3 @@ def stage_b_loss(
         state_weight=state_weight,
         plan_weight=plan_weight,
     )
-
-
-def symmetric_margin_loss(
-    *,
-    original_clamp_original_score: torch.Tensor,
-    original_clamp_counterfactual_score: torch.Tensor,
-    counterfactual_clamp_original_score: torch.Tensor,
-    counterfactual_clamp_counterfactual_score: torch.Tensor,
-    margin: float,
-) -> torch.Tensor:
-    original_direction = torch.relu(
-        margin
-        - (
-            original_clamp_original_score
-            - original_clamp_counterfactual_score
-        )
-    )
-    counterfactual_direction = torch.relu(
-        margin
-        - (
-            counterfactual_clamp_counterfactual_score
-            - counterfactual_clamp_original_score
-        )
-    )
-    return original_direction.mean() + counterfactual_direction.mean()

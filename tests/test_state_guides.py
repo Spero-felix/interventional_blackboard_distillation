@@ -1,7 +1,6 @@
 from ibd.schemas import STATE_ANCHOR_FIELDS, StateBlackboard
 from ibd.state_guides import (
     STATE_FIELD_GUIDES,
-    counterfactual_context,
     render_state_label_guide,
 )
 
@@ -11,13 +10,6 @@ def test_state_guides_cover_schema_fields_and_enum_values():
     properties = StateBlackboard.model_json_schema()["properties"]
     for field, guide in STATE_FIELD_GUIDES.items():
         assert tuple(properties[field]["enum"]) == tuple(guide.values)
-
-
-def test_counterfactual_context_excludes_original_and_missing_values():
-    context = counterfactual_context("advice_receptivity", "hesitant")
-    assert context["allowed_replacements"] == ["closed", "open", "requested"]
-    assert "unknown" not in context["allowed_replacements"]
-    assert context["original_value"] == "hesitant"
 
 
 def test_state_label_guide_contains_high_risk_boundaries():

@@ -25,13 +25,10 @@ anchor_temperature: 0.07
 cosine_weight: 1.0
 state_weight: 1.0
 plan_weight: 1.0
-margin: 0.5
 replay_weight: 0.1
 epochs:
   A: 1
   B: 5
-  B2: 0
-  C: 0
 scheduler_type: cosine
 scheduler_total_steps: 1128
 warmup_ratio: 0.03

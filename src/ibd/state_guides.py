@@ -147,28 +147,6 @@ STATE_FIELD_GUIDES: dict[StateField, StateFieldGuide] = {
 }
 
 
-def counterfactual_context(field: StateField, original_value: str) -> dict[str, object]:
-    """Return the legal replacement space and local response effects for one field."""
-
-    guide = STATE_FIELD_GUIDES[field]
-    if original_value not in guide.values:
-        raise ValueError(f"{original_value!r} is not valid for {field}")
-    return {
-        "target_field": field,
-        "target_field_definition": guide.definition,
-        "original_value": original_value,
-        "allowed_replacements": [
-            value
-            for value in guide.values
-            if value not in {original_value, "unknown"}
-        ],
-        "target_value_definitions": dict(guide.values),
-        "isolation_rule": guide.isolation_rule,
-        "permitted_local_effects": list(guide.permitted_local_effects),
-        "prohibited_local_effects": list(guide.prohibited_local_effects),
-    }
-
-
 def render_state_label_guide() -> str:
     """Render the canonical label definitions and boundaries for analyzer prompts."""
 

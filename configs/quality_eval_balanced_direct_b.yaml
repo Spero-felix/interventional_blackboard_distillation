@@ -3,11 +3,11 @@ standalone: true
 splits: [diagnostic_holdout]
 
 models:
-  - model_id: ibd-c-8e-5
+  - model_id: balanced-direct-b-2500
     source: student_checkpoint
-    training_config: ../runs/first-plan-ab2000-lr-8e-5/training_config-stage-C.yaml
-    checkpoint: ../runs/first-plan-ab2000-lr-8e-5/stage-C-step-906
-    run_name: first-plan-ab2000-lr-8e-5
+    training_config: ../runs/balanced-direct-b-2500-lr-8e-5-1500/training_config.yaml
+    checkpoint: ../runs/balanced-direct-b-2500-lr-8e-5-1500/stage-B-step-500
+    run_name: balanced-direct-b-2500-lr-8e-5-1500
 
 generation:
   max_new_tokens: 256

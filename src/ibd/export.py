@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .schemas import InterventionRecord, TeacherTrace
+from .schemas import TeacherTrace
 from .visible_sft import serialize_visible_sft
 
 
@@ -42,23 +42,4 @@ def visible_sft_row(trace: TeacherTrace) -> dict[str, Any]:
         "split": trace.split,
         "history": trace.history.model_dump(mode="json"),
         "response": serialize_visible_sft(trace),
-    }
-
-
-def intervention_row(record: InterventionRecord, prompt: str) -> dict[str, Any]:
-    clamp = record.mutated_state if record.function == "STATE" else record.mutated_plan
-    if clamp is None:
-        raise ValueError("intervention record is missing its mutated clamp value")
-    return {
-        "example_id": record.example_id,
-        "prompt": prompt,
-        "function": record.function,
-        "clamp": clamp.model_dump(mode="json"),
-        "full_response": record.full_response,
-        "counterfactual_response": record.counterfactual_response,
-        "target_dimension": record.target_dimension,
-        "affected_non_target_fields": list(record.affected_non_target_fields),
-        "conditional_correspondence_verified": (
-            record.conditional_correspondence_verified
-        ),
     }

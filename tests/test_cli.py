@@ -499,44 +499,14 @@ def _socialsim_dialogue(dialogue_id):
     }
 
 
-def test_cli_registers_complete_qwen_pipeline_command_surface():
+def test_cli_registers_supported_qwen_pipeline_commands():
     from ibd.cli import _build_parser
 
     parser = _build_parser()
-    subparsers = next(
-        action for action in parser._actions if action.__class__.__name__ == "_SubParsersAction"
-    )
-
-    assert {
-        "prepare-socialsim",
-        "run-teacher",
-        "build-interventions",
-        "precompute-anchors",
-        "train",
-        "train-pipeline",
-        "evaluate",
-        "generate",
-    }.issubset(subparsers.choices)
-
-    build_args = parser.parse_args(
-        [
-            "build-interventions",
-            "--config",
-            "teacher.yaml",
-            "--input",
-            "traces.jsonl",
-            "--output",
-            "interventions.jsonl",
-            "--manifest",
-            "manifest.json",
-            "--global-seed",
-            "73",
-            "--state-plan-policy",
-            "fixed-original",
-        ]
-    )
-    assert build_args.global_seed == 73
-    assert build_args.state_plan_policy == "fixed-original"
+    subparsers = next(action for action in parser._actions if action.__class__.__name__ == "_SubParsersAction")
+    assert {"prepare-socialsim", "run-teacher", "precompute-anchors", "train", "train-pipeline", "generate"}.issubset(subparsers.choices)
+    assert "build-interventions" not in subparsers.choices
+    assert "evaluate" not in subparsers.choices
 
     anchor_args = parser.parse_args(
         [
@@ -547,118 +517,28 @@ def test_cli_registers_complete_qwen_pipeline_command_surface():
             "traces.jsonl",
             "--output",
             "anchors.safetensors",
-            "--global-seed",
-            "73",
-            "--diagnostic-state-field",
-                "primary_support_need",
-            "--original-splits",
-            "dev",
         ]
     )
-    assert anchor_args.global_seed == 73
-    assert anchor_args.diagnostic_state_field == "primary_support_need"
-    assert anchor_args.original_splits == ["dev"]
-
-    evaluate_args = parser.parse_args(
-        [
-            "evaluate",
-            "--config",
-            "qwen.yaml",
-            "--run-name",
-            "seed-42",
-            "--checkpoint",
-            "checkpoint",
-            "--traces",
-            "traces.jsonl",
-            "--interventions",
-            "interventions.jsonl",
-            "--anchors",
-            "anchors.safetensors",
-            "--intervention-manifest",
-            "manifest.json",
-            "--output",
-            "evaluation.json",
-        ]
-    )
-    assert evaluate_args.interventions == "interventions.jsonl"
-    assert evaluate_args.intervention_manifest == "manifest.json"
-
-    generate_args = parser.parse_args(
-        [
-            "generate",
-            "--config",
-            "qwen.yaml",
-            "--run-name",
-            "seed-42",
-            "--checkpoint",
-            "checkpoint",
-            "--history",
-            "history.json",
-            "--clamp",
-            "STATE",
-            "--anchors",
-            "anchors.safetensors",
-            "--example-id",
-            "e-1",
-        ]
-    )
-    assert generate_args.clamp == "STATE"
-
-    train_args = parser.parse_args(
-        [
-            "train",
-            "--stage",
-            "B2",
-            "--config",
-            "qwen.yaml",
-            "--run-name",
-            "seed-42",
-            "--seed",
-            "42",
-            "--traces",
-            "traces.jsonl",
-            "--interventions",
-            "interventions.jsonl",
-            "--anchors",
-            "anchors.safetensors",
-        ]
-    )
-    assert train_args.stage == "B2"
-
-
-@pytest.mark.parametrize("command", ["build-interventions", "precompute-anchors"])
-def test_dataset_build_commands_require_an_explicit_global_seed(command, capsys):
-    from ibd.cli import _build_parser
-
-    common = ["--config", "config.yaml"]
-    if command == "build-interventions":
-        argv = [
-            command,
-            *common,
-            "--input",
-            "traces.jsonl",
-            "--output",
-            "interventions.jsonl",
-            "--margins-output",
-            "margins.jsonl",
-            "--manifest",
-            "manifest.json",
-        ]
-    else:
-        argv = [
-            command,
-            *common,
-            "--traces",
-            "traces.jsonl",
-            "--output",
-            "anchors.safetensors",
-            "--diagnostic-state-field",
-            "emotion",
-        ]
+    assert not hasattr(anchor_args, "interventions")
+    assert not hasattr(anchor_args, "global_seed")
+    assert not hasattr(anchor_args, "diagnostic_state_field")
 
     with pytest.raises(SystemExit):
-        _build_parser().parse_args(argv)
-    assert "--global-seed" in capsys.readouterr().err
+        parser.parse_args(
+            [
+                "generate",
+                "--config",
+                "qwen.yaml",
+                "--run-name",
+                "run",
+                "--checkpoint",
+                "checkpoint",
+                "--history",
+                "history.json",
+                "--clamp",
+                "STATE",
+            ]
+        )
 
 
 def test_prepare_socialsim_cli_writes_reproducible_artifact(tmp_path):

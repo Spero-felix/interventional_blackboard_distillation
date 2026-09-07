@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -16,30 +16,16 @@ from transformers import PreTrainedTokenizerBase
 from .config import STATE_TOKEN_LIMIT
 from .model import QwenSlotCausalLM
 from .schemas import (
-    MASKED_STATE_VALUE,
     PlanSelection,
     STATE_ANCHOR_FIELDS,
     StateBlackboard,
-    StateField,
 )
 
 
 _METADATA_KEY = "ibd_anchor_metadata"
 _EXAMPLE_ROWS_KEY = "ibd_example_to_row"
-_MUTATED_STATE_ROWS_KEY = "ibd_mutated_state_to_row"
-_MUTATED_PLAN_ROWS_KEY = "ibd_mutated_plan_to_row"
 def state_anchor_payload(state: StateBlackboard) -> dict[str, str]:
     return {field: getattr(state, field) for field in STATE_ANCHOR_FIELDS}
-
-
-def masked_state_anchor_payload(
-    state: StateBlackboard, field: StateField
-) -> dict[str, str]:
-    """Mask one field only in a temporary diagnostic anchor payload."""
-
-    payload = state_anchor_payload(state)
-    payload[field] = MASKED_STATE_VALUE
-    return payload
 
 
 def plan_anchor_payload(selection: PlanSelection) -> dict[str, str]:
@@ -71,16 +57,10 @@ class AnchorArtifact:
     plan: torch.Tensor
     example_to_row: dict[str, int]
     metadata: dict[str, Any]
-    mutated_state: torch.Tensor | None = None
-    mutated_plan: torch.Tensor | None = None
-    mutated_state_to_row: dict[str, int] = field(default_factory=dict)
-    mutated_plan_to_row: dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.state = self._frozen(self.state)
         self.plan = self._frozen(self.plan)
-        self.mutated_state = self._frozen_optional(self.mutated_state)
-        self.mutated_plan = self._frozen_optional(self.mutated_plan)
         if self.state.ndim != 2 or self.plan.ndim != 2:
             raise ValueError("STATE and PLAN anchor banks must be rank two")
         if self.state.shape[0] == 0 or self.state.shape[0] != self.plan.shape[0]:
@@ -88,16 +68,6 @@ class AnchorArtifact:
         if self.state.shape[1] != self.plan.shape[1]:
             raise ValueError("STATE and PLAN anchors must share hidden size")
         self._validate_mapping(self.example_to_row, self.state.shape[0], "example")
-        self._validate_optional(
-            self.mutated_state,
-            self.mutated_state_to_row,
-            "mutated STATE",
-        )
-        self._validate_optional(
-            self.mutated_plan,
-            self.mutated_plan_to_row,
-            "mutated PLAN",
-        )
         for name, tensor in self._tensors().items():
             norms = tensor.float().norm(dim=-1)
             if not torch.allclose(norms, torch.ones_like(norms), atol=2e-3, rtol=2e-3):
@@ -107,37 +77,13 @@ class AnchorArtifact:
     def _frozen(tensor: torch.Tensor) -> torch.Tensor:
         return tensor.detach().to(device="cpu").contiguous()
 
-    @classmethod
-    def _frozen_optional(cls, tensor: torch.Tensor | None) -> torch.Tensor | None:
-        return None if tensor is None else cls._frozen(tensor)
-
     @staticmethod
     def _validate_mapping(mapping: Mapping[str, int], rows: int, label: str) -> None:
         if len(mapping) != rows or set(mapping.values()) != set(range(rows)):
             raise ValueError(f"{label} row mapping must cover every row exactly once")
 
-    @classmethod
-    def _validate_optional(
-        cls,
-        tensor: torch.Tensor | None,
-        mapping: Mapping[str, int],
-        label: str,
-    ) -> None:
-        if tensor is None:
-            if mapping:
-                raise ValueError(f"{label} mapping requires a tensor bank")
-            return
-        if tensor.ndim != 2 or tensor.shape[0] == 0:
-            raise ValueError(f"{label} anchor bank must be non-empty and rank two")
-        cls._validate_mapping(mapping, tensor.shape[0], label)
-
     def _tensors(self) -> dict[str, torch.Tensor]:
-        tensors = {"state": self.state, "plan": self.plan}
-        if self.mutated_state is not None:
-            tensors["mutated_state"] = self.mutated_state
-        if self.mutated_plan is not None:
-            tensors["mutated_plan"] = self.mutated_plan
-        return tensors
+        return {"state": self.state, "plan": self.plan}
 
     def positive_rows(self, example_ids: Sequence[str]) -> torch.Tensor:
         try:
@@ -152,8 +98,6 @@ class AnchorArtifact:
         metadata = {
             _METADATA_KEY: json.dumps(self.metadata, ensure_ascii=False, sort_keys=True),
             _EXAMPLE_ROWS_KEY: json.dumps(self.example_to_row, sort_keys=True),
-            _MUTATED_STATE_ROWS_KEY: json.dumps(self.mutated_state_to_row, sort_keys=True),
-            _MUTATED_PLAN_ROWS_KEY: json.dumps(self.mutated_plan_to_row, sort_keys=True),
         }
         save_file(self._tensors(), target, metadata=metadata)
 
@@ -173,10 +117,6 @@ class AnchorArtifact:
             plan=tensors["plan"],
             example_to_row=json.loads(metadata[_EXAMPLE_ROWS_KEY]),
             metadata=artifact_metadata,
-            mutated_state=tensors.get("mutated_state"),
-            mutated_plan=tensors.get("mutated_plan"),
-            mutated_state_to_row=json.loads(metadata.get(_MUTATED_STATE_ROWS_KEY, "{}")),
-            mutated_plan_to_row=json.loads(metadata.get(_MUTATED_PLAN_ROWS_KEY, "{}")),
         )
 
 

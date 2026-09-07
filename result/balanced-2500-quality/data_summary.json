@@ -1,8 +1,11 @@
 {
   "source": {
-    "report": "artifacts/quality/balanced-2500-best-holdout/judge/quality_report.json",
-    "judgments": "artifacts/quality/balanced-2500-best-holdout/judge/judgments.jsonl",
-    "responses": "artifacts/quality/balanced-2500-best-holdout/generation/responses.jsonl",
+    "report": "../../../tmp/ibd-direct-b-charts.MzkVL7/judge/quality_report.json",
+    "judgments": "../../../tmp/ibd-direct-b-charts.MzkVL7/judge/judgments.jsonl",
+    "responses": [
+      "artifacts/quality/balanced-2500-best-holdout/generation/responses.jsonl",
+      "artifacts/quality/balanced-direct-b-2500-only/generation/responses.jsonl"
+    ],
     "split": "diagnostic_holdout"
   },
   "note": "Fixed single-judge evaluation. Values are descriptive holdout results, not human-preference estimates.",
@@ -21,6 +24,21 @@
         "expected": 300
       },
       "mean_response_words": 18.186666666666667
+    },
+    {
+      "model_id": "balanced-direct-b-2500",
+      "label": "Direct-B",
+      "coherence": 4.47,
+      "effectiveness": 3.6133,
+      "empathy": 3.5133,
+      "non_coerciveness": 4.6633,
+      "overall": 4.03,
+      "relevance": 3.89,
+      "coverage": {
+        "actual": 300,
+        "expected": 300
+      },
+      "mean_response_words": 18.686666666666667
     },
     {
       "model_id": "balanced-visible-sft-2500",
@@ -99,6 +117,16 @@
     }
   ],
   "stage_b_pairwise": [
+    {
+      "target": "balanced-direct-b-2500",
+      "n": 300,
+      "delta": 0.10266666666666666,
+      "low": 0.0523661724674518,
+      "high": 0.15296716086588152,
+      "wins": 100,
+      "ties": 131,
+      "losses": 69
+    },
     {
       "target": "teacher",
       "n": 300,

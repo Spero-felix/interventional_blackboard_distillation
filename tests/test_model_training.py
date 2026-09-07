@@ -99,16 +99,6 @@ def test_length_normalized_score_does_not_reward_shorter_sequence():
     assert length_normalized_score(scores, mask).tolist() == pytest.approx([-0.2, -0.2])
 
 
-def test_stage_c_natural_sft_always_uses_original_response_identity():
-    from ibd.trainer import _stage_c_natural_sft_scores
-
-    selected = _stage_c_natural_sft_scores(
-        torch.tensor([0.2, 0.3]),
-        torch.tensor([0.7, 0.8]),
-    )
-
-    assert torch.equal(selected, torch.tensor([0.2, 0.3]))
-
 
 def test_adapter_has_exactly_state_and_plan_latent_slots_and_supports_clamp():
     from ibd.model import LatentBlackboardCausalLM

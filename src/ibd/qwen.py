@@ -31,21 +31,9 @@ class StageEpochs(BaseModel):
 
     A: int = Field(default=1, ge=0)
     B: int = Field(default=1, ge=0)
-    B2: int = Field(default=0, ge=0)
-    C: int = Field(default=1, ge=0)
 
-    def for_stage(self, stage: Literal["A", "B", "B2", "C"]) -> int:
+    def for_stage(self, stage: Literal["A", "B"]) -> int:
         return getattr(self, stage)
-
-
-class B2LossConfig(BaseModel):
-    """Weights for the anchor-conditioned B2 objective."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    natural_weight: float = Field(default=1.0, ge=0.0)
-    conditioned_weight: float = Field(default=1.0, ge=0.0)
-    alignment_weight: float = Field(default=0.1, ge=0.0)
 
 
 class QwenTrainingConfig(BaseModel):
@@ -71,9 +59,7 @@ class QwenTrainingConfig(BaseModel):
     cosine_weight: float = Field(default=1.0, ge=0.0)
     state_weight: float = Field(default=1.0, ge=0.0)
     plan_weight: float = Field(default=1.0, ge=0.0)
-    margin: float = Field(default=0.5, ge=0.0)
     replay_weight: float = Field(default=0.1, ge=0.0)
-    b2: B2LossConfig = Field(default_factory=B2LossConfig)
     max_optimizer_steps_per_stage: int | None = Field(default=None, gt=0)
     epochs: StageEpochs = Field(default_factory=StageEpochs)
     scheduler_type: Literal["constant", "cosine"] = "constant"
@@ -93,12 +79,10 @@ class QwenTrainingConfig(BaseModel):
         if not self.gradient_checkpointing:
             raise ValueError("3090 protocol requires gradient checkpointing")
         if self.micro_batch_size != 1:
-            raise ValueError("3090 functional-pair protocol requires micro_batch_size=1")
+            raise ValueError("3090 training protocol requires micro_batch_size=1")
         if self.slot_layer != 13:
             raise ValueError("production slot_layer must be 13")
-        if all(
-            self.epochs.for_stage(stage) == 0 for stage in ("A", "B", "B2", "C")
-        ):
+        if all(self.epochs.for_stage(stage) == 0 for stage in ("A", "B")):
             raise ValueError("at least one training stage must have positive epochs")
         return self
 

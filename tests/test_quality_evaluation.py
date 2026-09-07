@@ -66,10 +66,10 @@ def test_standalone_quality_config_allows_one_student_without_teacher(tmp_path):
         standalone=True,
         models=[
             EvaluatedModel(
-                model_id="ibd-c",
+                model_id="extra-model",
                 source="student_checkpoint",
                 training_config=tmp_path / "training.yaml",
-                checkpoint=tmp_path / "stage-C-step-906",
+                checkpoint=tmp_path / "supplemental-step-906",
                 run_name="first-plan-ab2000-lr-8e-5",
             )
         ],
@@ -77,7 +77,7 @@ def test_standalone_quality_config_allows_one_student_without_teacher(tmp_path):
     )
 
     assert config.standalone is True
-    assert [model.model_id for model in config.models] == ["ibd-c"]
+    assert [model.model_id for model in config.models] == ["extra-model"]
 
 
 def test_non_standalone_quality_config_rejects_a_single_student(tmp_path):
@@ -90,28 +90,16 @@ def test_non_standalone_quality_config_rejects_a_single_student(tmp_path):
         QualityEvalConfig(
             models=[
                 EvaluatedModel(
-                    model_id="ibd-c",
+                    model_id="extra-model",
                     source="student_checkpoint",
                     training_config=tmp_path / "training.yaml",
-                    checkpoint=tmp_path / "stage-C-step-906",
+                    checkpoint=tmp_path / "supplemental-step-906",
                     run_name="first-plan-ab2000-lr-8e-5",
                 )
             ],
             judge=ModelConfig(model="fixed-judge"),
         )
 
-
-def test_first_plan_c_quality_config_uses_selected_stage_c_checkpoint():
-    from ibd.quality import QualityEvalConfig
-
-    config = QualityEvalConfig.from_yaml("configs/quality_eval_first_c.yaml")
-
-    assert config.standalone is True
-    assert [model.model_id for model in config.models] == ["ibd-c-8e-5"]
-    model = config.models[0]
-    assert model.training_config.is_file()
-    assert model.checkpoint.is_dir()
-    assert model.checkpoint.name == "stage-C-step-906"
 
 
 def _write_judge_artifact(tmp_path, *, model_scores, judge_seed=4242):
@@ -178,12 +166,12 @@ def test_merge_quality_judgments_writes_report_and_ranked_six_model_results(tmp_
             "visible-sft-2000-lr-8e-5": 1,
         },
     )
-    _write_judge_artifact(standalone_dir, model_scores={"ibd-c-8e-5": 5})
+    _write_judge_artifact(standalone_dir, model_scores={"extra-model": 5})
 
     ranking = merge_quality_judgments(base_dir, standalone_dir, output_dir)
 
     assert [entry["model_id"] for entry in ranking["ranking"]] == [
-        "ibd-c-8e-5",
+        "extra-model",
         "base",
         "ibd-b-8e-5",
         "standard-sft-8e-5",
@@ -204,7 +192,7 @@ def test_merge_quality_judgments_rejects_incompatible_judge_settings(tmp_path):
     standalone_dir = tmp_path / "c-only"
     _write_judge_artifact(base_dir, model_scores={"teacher": 3, "base": 3})
     _write_judge_artifact(
-        standalone_dir, model_scores={"ibd-c-8e-5": 3}, judge_seed=7
+        standalone_dir, model_scores={"extra-model": 3}, judge_seed=7
     )
 
     with pytest.raises(ValueError, match="Judge settings"):

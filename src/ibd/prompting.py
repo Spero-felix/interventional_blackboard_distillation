@@ -8,7 +8,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from .schemas import History
-from .state_guides import STATE_FIELD_GUIDES, render_state_label_guide
+from .state_guides import render_state_label_guide
 
 ESCONV_STRATEGIES = {
     "Question": (
@@ -242,54 +242,6 @@ _ROLE_PROMPTS = {
             "Output Contract": "Return ONLY JSON matching the supplied schema.",
         },
     ),
-    "state_counterfactual_generator": _prompt(
-        Role="You are a controlled seven-dimensional STATE counterfactual editor.",
-        Objective="Replace exactly one requested STATE field with one different, valid enum value to create a controlled experimental condition.",
-        **{
-            "Available Inputs": "The complete dialogue history, current seven-field STATE, target field, target field definition, original value, allowed replacement values, and permitted local response effects.",
-            "Responsibilities": "Return exactly one replacement that is supplied as allowed, differs from the original, represents a meaningful target-field change, and changes only the construct represented by that field.",
-            "Procedure": "Interpret the target definition and boundary rules. Select one allowed value that creates a clear contrast along the target field's semantic axis. The replacement is an experimental condition and need not be the best-supported interpretation of the original dialogue. Use dialogue only to understand the condition and avoid inventing an event, relationship, demographic fact, or external circumstance. Keep the other six STATE meanings unchanged.",
-            "Constraints": "Return one exact enum value from allowed_replacements. Do not return the original, unknown, or <MASKED>. Do not edit another field or generate a strategy, goal, act, or response. Do not choose a value because it is expected to produce a better, worse, more active, more supportive, or more easily distinguishable response. Respect the canonical seven-field isolation rules.",
-            "Quality Criteria": "The replacement is a valid, meaningful, localized contrast and does not encode a preferred strategy or response outcome.",
-            "Output Contract": "Return ONLY JSON matching the supplied schema with replacement only.",
-        },
-    ),
-    "condition_effect_verifier": _prompt(
-        Role="You are a blind PLAN conditional-effect verifier.",
-        Objective="Verify that each response fits its own PLAN and that changing PLAN causes a meaningful strategy-consistent response change.",
-        **{
-            "Available Inputs": "Dialogue plus two complete PLAN-response bundles A and B.",
-            "Responsibilities": "Judge A only against A and B only against B; treat both as valid controls.",
-            "Procedure": "Assess both fits independently. Require a functional response difference attributable to the PLAN difference; lexical variation alone is insufficient. Repeat after the complete bundles are swapped.",
-            "Constraints": "Do not rank global quality or call either response chosen, rejected, positive, negative, better, or degraded.",
-            "Quality Criteria": "The verdict is conservative, strategy-grounded, and order invariant.",
-            "Output Contract": "Return ONLY JSON matching the supplied schema.",
-        },
-    ),
-    "state_effect_verifier": _prompt(
-        Role="You are a blind STATE field-effect verifier.",
-        Objective="Verify that each response fits its own target-field value and that changing only that field causes a meaningful localized change.",
-        **{
-            "Available Inputs": "Dialogue, target_field, six unchanged STATE fields, and two complete condition-response bundles.",
-            "Responsibilities": "Judge each response against its own condition, verify the target field's permitted local effect, and report every materially affected non-target STATE field.",
-            "Procedure": "Evaluate A and B independently. Compare response function rather than lexical wording. Confirm that the target-field effect is present and that no material functional change belongs to another STATE field. Repeat after swapping whole bundles.",
-            "Constraints": "Treat both conditions as equally valid experimental controls. Do not decide which is factual, preferred, better, or degraded. Do not count an overall quality difference or lexical difference as a localized field effect.",
-            "Quality Criteria": "Both responses fit their own conditions, the target effect is functional and present, non-target STATE functions remain stable, and the verdict is order invariant.",
-            "Output Contract": "Return ONLY JSON matching the supplied schema.",
-        },
-    ),
-    "safety_verifier": _prompt(
-        Role="You are a standalone offline safety verifier.",
-        Objective="Check whether both conditional responses are safe enough to retain for training.",
-        **{
-            "Available Inputs": "Dialogue, original-conditioned response, and counterfactual-conditioned response.",
-            "Responsibilities": "Flag only concrete harmful instructions, encouragement of harm, coercion or serious boundary violations, dangerous factual claims, improper high-stakes substitution, or exploitation of dependency.",
-            "Procedure": "Assess each response independently and provide concise evidence.",
-            "Constraints": "Assess the two responses independently. Do not rank response quality. Do not treat a strategy, STATE or PLAN value, emotional intensity, a suggestion, a question, information, or closure as unsafe by itself.",
-            "Quality Criteria": "Use high precision and preserve valid alternative responses.",
-            "Output Contract": "Return ONLY JSON matching the supplied schema.",
-        },
-    ),
 }
 
 _CANDIDATE_PROMPT = _prompt(
@@ -307,7 +259,6 @@ _CANDIDATE_PROMPT = _prompt(
 _ROLE_PROMPTS["candidate"] = _CANDIDATE_PROMPT
 
 PROMPT_ROLES = tuple(_ROLE_PROMPTS)
-_STATE_CLAMP_ROLES = {"planner", "candidate", "final_selector"}
 
 
 def _jsonable(value: Any) -> Any:
@@ -339,40 +290,6 @@ def _resolved_prompt(role: str, context: dict[str, Any]) -> str:
         prompt += (
             f"\n\n# Assigned Strategy\n"
             f"{strategy}: {ESCONV_STRATEGIES[strategy]}"
-        )
-        fixed_plan = context.get("fixed_plan")
-        if fixed_plan is not None:
-            if not isinstance(fixed_plan, dict):
-                raise ValueError("fixed PLAN intervention requires plan fields")
-            required = {"strategies", "response_goal", "response_act"}
-            if not required.issubset(fixed_plan):
-                raise ValueError("fixed PLAN intervention requires complete plan fields")
-            prompt += (
-                "\n\n# Experimental PLAN Clamp\n"
-                "Treat the supplied fixed_plan strategy, response_goal, and response_act "
-                "as authoritative. Realize them without replanning. Dialogue and STATE "
-                "control only the contextually appropriate realization. If STATE is also "
-                "clamped, it applies only through the target field's permitted local "
-                "effects while PLAN remains fixed."
-            )
-    clamped_field = context.get("clamped_state_field")
-    if clamped_field is not None and role in _STATE_CLAMP_ROLES:
-        state = context.get("state")
-        if not isinstance(state, dict) or clamped_field not in state:
-            raise ValueError("clamped STATE intervention requires its STATE value")
-        try:
-            guide = STATE_FIELD_GUIDES[clamped_field]
-        except KeyError as error:
-            raise ValueError(f"unknown clamped STATE field: {clamped_field}") from error
-        effects = ", ".join(guide.permitted_local_effects)
-        prompt += (
-            "\n\n# Experimental STATE Clamp\n"
-            f"Treat STATE.{clamped_field}={state[clamped_field]!r} as the authoritative "
-            "experimental condition. Do not reconstruct it from dialogue; it may be "
-            "counterfactual. Keep the other six STATE values unchanged. "
-            f"Field meaning: {guide.definition} Permitted local effects: {effects}. "
-            "This value is not evidence that another state, dialogue fact, strategy, "
-            "or preference changed."
         )
     return prompt
 

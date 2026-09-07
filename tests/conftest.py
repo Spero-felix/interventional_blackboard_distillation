@@ -54,11 +54,7 @@ class ScriptedBackend:
                 "response_act": f"候选动作-{candidate_id}",
             }
         else:
-            if role == "state_counterfactual_generator":
-                context = json.loads(messages[1]["content"])["context"]
-                payload = {"replacement": context["allowed_replacements"][0]}
-            else:
-                payload = self._payload(role, seed)
+            payload = self._payload(role, seed)
         return LLMResult(text=json.dumps(payload, ensure_ascii=False), usage={"total_tokens": 10})
 
     def _payload(self, role: str, seed: int | None):

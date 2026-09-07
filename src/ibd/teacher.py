@@ -8,8 +8,6 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from pydantic import create_model
-
 from .backend import LLMBackend, LLMResult, StructuredCaller
 from .config import AppConfig, ModelConfig
 from .prompting import build_messages
@@ -20,15 +18,12 @@ from .schemas import (
     FinalSelectionDecision,
     History,
     MultiViewStateAnalysis,
-    PlanSelection,
-    StateField,
     StateBlackboard,
     StrictModel,
     StrategyName,
     StrategyPlanSet,
     TeacherTrace,
 )
-from .state_guides import counterfactual_context
 
 NORMAL_ROLES = (
     "multi_view_state_analyzer",
@@ -195,44 +190,6 @@ class TeacherRunner:
             call_records=records,
         )
 
-    def generate_state_counterfactual(
-        self,
-        history: History,
-        state: StateBlackboard,
-        target_field: StateField,
-        *,
-        example_id: str,
-    ) -> str:
-        records: list[CallRecord] = []
-        target_context = counterfactual_context(
-            target_field, getattr(state, target_field)
-        )
-        allowed_replacements = tuple(target_context["allowed_replacements"])
-        replacement_type = Literal.__getitem__(allowed_replacements)
-        response_model = create_model(
-            f"{target_field.title().replace('_', '')}Counterfactual",
-            __base__=StrictModel,
-            replacement=(replacement_type, ...),
-        )
-        result = self._call(
-            "state_counterfactual_generator",
-            history,
-            response_model,
-            records,
-            context={
-                "state": state,
-                **target_context,
-            },
-            example_id=example_id,
-        )
-        replacement = result.replacement
-        if replacement not in target_context["allowed_replacements"]:
-            raise ValueError(
-                f"STATE counterfactual replacement {replacement!r} is not allowed "
-                f"for {target_field}"
-            )
-        return replacement
-
     def _run_from_state(
         self,
         history: History,
@@ -240,11 +197,8 @@ class TeacherRunner:
         records: list[CallRecord],
         *,
         example_id: str | None = None,
-        clamped_state_field: str | None = None,
     ) -> DownstreamResult:
         context: dict[str, Any] = {"state": state}
-        if clamped_state_field is not None:
-            context["clamped_state_field"] = clamped_state_field
         plan = self._call(
             "planner",
             history,
@@ -261,7 +215,6 @@ class TeacherRunner:
                 strategy=strategy,
                 local_index=index,
                 records=records,
-                clamped_state_field=clamped_state_field,
             )
             for index, strategy in enumerate(plan.strategies, start=1)
         ]
@@ -271,7 +224,6 @@ class TeacherRunner:
             candidates=candidates,
             records=records,
             example_id=example_id,
-            clamped_state_field=clamped_state_field,
         )
         return DownstreamResult(final_selection, plan, candidates, records)
 
@@ -284,8 +236,6 @@ class TeacherRunner:
         strategy: StrategyName,
         local_index: int,
         records: list[CallRecord],
-        clamped_state_field: str | None = None,
-        fixed_plan: PlanSelection | None = None,
     ) -> Candidate:
         strategy_id = f"S{local_index}"
         context: dict[str, Any] = {
@@ -294,12 +244,6 @@ class TeacherRunner:
             "strategy_id": strategy_id,
             "strategy": strategy,
         }
-        if clamped_state_field is not None:
-            context["clamped_state_field"] = clamped_state_field
-        if fixed_plan is not None:
-            if fixed_plan.strategies[0] != strategy:
-                raise ValueError("fixed plan strategy must match assigned candidate strategy")
-            context["fixed_plan"] = fixed_plan
         generated = self._call(
             "candidate",
             history,
@@ -338,30 +282,6 @@ class TeacherRunner:
             ).digest(),
         )
 
-    def generate_response_under_fixed_plan(
-        self,
-        history: History,
-        state: StateBlackboard,
-        plan: PlanSelection,
-        *,
-        clamped_state_field: str,
-        example_id: str,
-    ) -> str:
-        """Generate one response after changing STATE while holding PLAN fixed."""
-
-        records: list[CallRecord] = []
-        candidate = self._generate_candidate(
-            example_id=example_id,
-            history=history,
-            state=state,
-            strategy=plan.strategies[0],
-            local_index=1,
-            records=records,
-            clamped_state_field=clamped_state_field,
-            fixed_plan=plan,
-        )
-        return candidate.response
-
     def _run_final_selector(
         self,
         *,
@@ -370,14 +290,11 @@ class TeacherRunner:
         candidates: list[Candidate],
         records: list[CallRecord],
         example_id: str | None,
-        clamped_state_field: str | None = None,
     ) -> FinalSelection:
         context: dict[str, Any] = {
             "state": state,
             "candidates": self._selector_candidates(candidates, example_id),
         }
-        if clamped_state_field is not None:
-            context["clamped_state_field"] = clamped_state_field
         decision = self._call(
             "final_selector",
             history,
@@ -394,20 +311,3 @@ class TeacherRunner:
         if len(selected) != 1:
             raise ValueError("final_selector must identify exactly one supplied candidate")
         return FinalSelection.from_candidate(selected[0], decision)
-
-    def rerun_downstream(
-        self,
-        history: History,
-        state: StateBlackboard,
-        *,
-        example_id: str | None = None,
-        clamped_state_field: str | None = None,
-    ) -> DownstreamResult:
-        records: list[CallRecord] = []
-        return self._run_from_state(
-            history,
-            state,
-            records,
-            example_id=example_id,
-            clamped_state_field=clamped_state_field,
-        )

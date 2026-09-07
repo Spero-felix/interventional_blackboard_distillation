@@ -16,12 +16,10 @@ from pydantic import Field
 from .schemas import StrictModel
 
 
-StageName = Literal["A", "B", "B2", "C", "SFT"]
+StageName = Literal["A", "B", "SFT"]
 _LEGAL_SOURCES: dict[StageName, set[StageName]] = {
     "A": {"A"},
     "B": {"A", "B"},
-    "B2": {"B", "B2"},
-    "C": {"B", "C"},
     "SFT": {"SFT"},
 }
 

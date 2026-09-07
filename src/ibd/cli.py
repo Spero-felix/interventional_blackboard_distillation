@@ -9,12 +9,10 @@ from typing import Any, Sequence
 
 from .backend import OpenAIBackend
 from .config import AppConfig
-from .export import intervention_row, sft_row, slot_row, visible_sft_row
+from .export import sft_row, slot_row, visible_sft_row
 from .progress import track
 from .schemas import (
     History,
-    InterventionRecord,
-    STATE_ANCHOR_FIELDS,
     TeacherTrace,
 )
 from .storage import append_jsonl, read_jsonl, write_jsonl
@@ -63,7 +61,7 @@ def _build_parser() -> argparse.ArgumentParser:
     export_parser = commands.add_parser("export-student")
     export_parser.add_argument(
         "--kind",
-        choices=("sft", "slot", "visible-sft", "intervention"),
+        choices=("sft", "slot", "visible-sft"),
         required=True,
     )
     export_parser.add_argument("--input", required=True)
@@ -87,36 +85,17 @@ def _build_parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--early-fraction", type=float, default=0.1)
     prepare_parser.add_argument("--late-fraction", type=float, default=0.1)
 
-    intervention_parser = commands.add_parser("build-interventions")
-    intervention_parser.add_argument("--config", required=True)
-    intervention_parser.add_argument("--input", required=True)
-    intervention_parser.add_argument("--output", required=True)
-    intervention_parser.add_argument("--manifest", required=True)
-    intervention_parser.add_argument("--global-seed", type=int, required=True)
-    intervention_parser.add_argument(
-        "--state-plan-policy",
-        choices=("rerun", "fixed-original"),
-        default="rerun",
-    )
-
     anchor_parser = commands.add_parser("precompute-anchors")
     anchor_parser.add_argument("--config", required=True)
     anchor_parser.add_argument("--traces", required=True)
-    anchor_parser.add_argument("--interventions")
     anchor_parser.add_argument("--output", required=True)
     anchor_parser.add_argument("--batch-size", type=int, default=1)
     anchor_parser.add_argument("--device", type=int, default=0)
-    anchor_parser.add_argument("--global-seed", type=int, required=True)
     anchor_parser.add_argument(
         "--original-splits",
         nargs="+",
         choices=("train", "dev", "diagnostic_holdout"),
         default=["train"],
-    )
-    anchor_parser.add_argument(
-        "--diagnostic-state-field",
-        choices=STATE_ANCHOR_FIELDS,
-        required=True,
     )
 
     def add_training_arguments(command_parser: argparse.ArgumentParser) -> None:
@@ -124,14 +103,13 @@ def _build_parser() -> argparse.ArgumentParser:
         command_parser.add_argument("--run-name", required=True)
         command_parser.add_argument("--seed", type=int, required=True)
         command_parser.add_argument("--traces", required=True)
-        command_parser.add_argument("--interventions", required=True)
         command_parser.add_argument("--anchors", required=True)
         command_parser.add_argument("--run-dir", default="runs")
         command_parser.add_argument("--resume")
         command_parser.add_argument("--device", type=int, default=0)
 
     train_parser = commands.add_parser("train")
-    train_parser.add_argument("--stage", choices=("A", "B", "B2", "C"), required=True)
+    train_parser.add_argument("--stage", choices=("A", "B"), required=True)
     add_training_arguments(train_parser)
 
     pipeline_parser = commands.add_parser("train-pipeline")
@@ -148,25 +126,11 @@ def _build_parser() -> argparse.ArgumentParser:
     control_parser.add_argument("--resume")
     control_parser.add_argument("--device", type=int, default=0)
 
-    evaluate_parser = commands.add_parser("evaluate")
-    evaluate_parser.add_argument("--config", required=True)
-    evaluate_parser.add_argument("--run-name", required=True)
-    evaluate_parser.add_argument("--checkpoint", required=True)
-    evaluate_parser.add_argument("--traces", required=True)
-    evaluate_parser.add_argument("--interventions", required=True)
-    evaluate_parser.add_argument("--anchors", required=True)
-    evaluate_parser.add_argument("--intervention-manifest", required=True)
-    evaluate_parser.add_argument("--output", required=True)
-    evaluate_parser.add_argument("--device", type=int, default=0)
-
     generate_parser = commands.add_parser("generate")
     generate_parser.add_argument("--config", required=True)
     generate_parser.add_argument("--run-name", required=True)
     generate_parser.add_argument("--checkpoint", required=True)
     generate_parser.add_argument("--history", required=True)
-    generate_parser.add_argument("--clamp", choices=("STATE", "PLAN"))
-    generate_parser.add_argument("--anchors")
-    generate_parser.add_argument("--example-id")
     generate_parser.add_argument("--output")
     generate_parser.add_argument("--max-new-tokens", type=int, default=256)
     generate_parser.add_argument("--device", type=int, default=0)
@@ -214,12 +178,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command in {
-        "build-interventions",
         "precompute-anchors",
         "train",
         "train-pipeline",
         "train-sft-control",
-        "evaluate",
         "generate",
     }:
         from .pipeline import run_pipeline_command
@@ -314,10 +276,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             rows.append(slot_row(TeacherTrace.model_validate(record)))
         elif args.kind == "visible-sft":
             rows.append(visible_sft_row(TeacherTrace.model_validate(record)))
-        else:
-            prompt = str(record["prompt"])
-            payload = {key: value for key, value in record.items() if key != "prompt"}
-            rows.append(intervention_row(InterventionRecord.model_validate(payload), prompt))
     write_jsonl(args.output, rows)
     print(f"wrote {len(rows)}")
     return 0

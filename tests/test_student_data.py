@@ -205,36 +205,6 @@ def test_collator_rejects_structure_tokens_in_response():
         )
 
 
-def test_pair_collator_encodes_both_conditions_and_retains_function():
-    from ibd.student_data import QwenPairCollator, add_ibd_tokens
-
-    tokenizer = FakeTokenizer()
-    collator = QwenPairCollator(
-        tokenizer,
-        max_length=16,
-        left_key="full_response",
-        right_key="intervened_response",
-        token_ids=add_ibd_tokens(tokenizer),
-    )
-
-    batch = collator(
-        [
-            {
-                "example_id": "e-1",
-                "history": _history(),
-                "full_response": "one two",
-                "intervened_response": "one",
-                "function": "STATE",
-            }
-        ]
-    )
-
-    assert batch["original"]["example_ids"] == ["e-1"]
-    assert batch["counterfactual"]["example_ids"] == ["e-1"]
-    assert batch["original"]["input_ids"].shape[1] == 8
-    assert batch["counterfactual"]["input_ids"].shape[1] == 7
-    assert batch["functions"] == ["STATE"]
-
 
 def test_generation_prompt_has_slots_but_no_labels():
     from ibd.student_data import encode_generation_prompt, add_ibd_tokens

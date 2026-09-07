@@ -45,7 +45,6 @@ EXPECTED_STATE_VALUES = {
     ),
     "distress_level": ("low", "moderate", "high", "unknown"),
     "primary_support_need": (
-        "emotional_expression",
         "validation",
         "esteem_support",
         "sensemaking",

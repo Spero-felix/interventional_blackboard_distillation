@@ -6,7 +6,6 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-FunctionName = Literal["STATE", "PLAN"]
 StrategyId = Literal["S1", "S2", "S3"]
 StrategyName = Literal[
     "Question",
@@ -18,11 +17,6 @@ StrategyName = Literal[
     "Information",
     "Others",
 ]
-NonSafetyDimension = Literal[
-    "emotion", "need", "relationship", "intent", "specificity", "timing",
-    "effectiveness", "autonomy", "factuality", "non_template",
-]
-MASKED_STATE_VALUE = "<MASKED>"
 DominantEmotion = Literal[
     "sadness_loss",
     "fear_anxiety",
@@ -105,7 +99,6 @@ class History(StrictModel):
         if self.turns[-1].role != "seeker":
             raise ValueError("history must end with a seeker turn")
         return self
-
     def as_prompt(self) -> str:
         return "\n".join(f"{turn.role}: {turn.content}" for turn in self.turns)
 
@@ -169,10 +162,6 @@ class MultiViewStateAnalysis(StrictModel):
             if value != "unknown" and not evidence.evidence.strip():
                 raise ValueError(f"{field} requires non-blank evidence")
         return self
-
-
-class StateCounterfactual(StrictModel):
-    replacement: str = Field(min_length=1)
 
 
 class StrategyPlanSet(StrictModel):
@@ -250,12 +239,6 @@ class FinalSelection(StrictModel):
         )
 
 
-class SafetyVerdict(StrictModel):
-    original_safe: bool
-    counterfactual_safe: bool
-    evidence: str = Field(min_length=1)
-
-
 class CallRecord(StrictModel):
     role: str
     attempt: int = Field(ge=1)
@@ -300,51 +283,4 @@ class TeacherTrace(StrictModel):
             or self.final_selection.response != candidate.response
         ):
             raise ValueError("final selection must be canonicalized from its candidate")
-        return self
-
-
-class Mutation(StrictModel):
-    operation: Literal[
-        "mask_state_field", "replace_state_field", "replace_plan_categories"
-    ]
-    field: str
-    before: object
-    after: object
-
-
-class InterventionRecord(StrictModel):
-    example_id: str
-    function: FunctionName
-    mutation: Mutation
-    mutated_state: StateBlackboard | None = None
-    mutated_plan: PlanSelection | None = None
-    full_response: str = Field(min_length=1)
-    counterfactual_response: str = Field(min_length=1)
-    target_dimension: NonSafetyDimension
-    affected_non_target_fields: list[StateField] = Field(default_factory=list)
-    conditioning_contract: Literal[
-        "legacy_joint_downstream_v1", "single_variable_v1"
-    ] = "legacy_joint_downstream_v1"
-    localized_effect: bool = True
-    conditional_correspondence_verified: bool = True
-    bidirectional_verified: bool
-
-    @model_validator(mode="after")
-    def validate_intervention(self) -> "InterventionRecord":
-        if not (
-            self.localized_effect
-            and self.conditional_correspondence_verified
-            and self.bidirectional_verified
-        ):
-            raise ValueError("retained intervention must pass conditional verification")
-        if self.function == "STATE":
-            if self.mutation.operation != "replace_state_field":
-                raise ValueError("STATE intervention must replace a state field")
-            if self.mutated_state is None or self.mutated_plan is not None:
-                raise ValueError("STATE intervention must carry only mutated_state")
-        else:
-            if self.mutation.operation != "replace_plan_categories":
-                raise ValueError("PLAN intervention must replace its strategy")
-            if self.mutated_plan is None or self.mutated_state is not None:
-                raise ValueError("PLAN intervention must carry only mutated_plan")
         return self
