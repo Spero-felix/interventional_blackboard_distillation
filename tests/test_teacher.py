@@ -9,9 +9,12 @@ from ibd.config import ModelConfig
 from ibd.prompting import ESCONV_STRATEGIES, PROMPT_ROLES, build_messages
 from ibd.schemas import (
     Candidate,
+    ContextPatch,
     FinalSelectionDecision,
+    History,
     MultiViewStateAnalysis,
     StrategyPlanSet,
+    UserContext,
 )
 from ibd.teacher import NORMAL_ROLES, TeacherRunner, _PlainTextCandidateBackend
 
@@ -112,6 +115,81 @@ def test_analyzer_prompt_uses_seven_state_guide(history):
     assert "advice_receptivity" in prompt
     assert "unknown as a middle or low value" in prompt
     assert "at most 20 words" not in prompt
+
+
+def test_context_updater_prompt_receives_previous_context_and_recent_turns():
+    recent = History.model_validate(
+        {
+            "turns": [
+                {"role": "supporter", "content": "你愿意说说最担心什么吗？"},
+                {
+                    "role": "seeker",
+                    "content": "我只想先把今晚熬过去，不想听长期建议。",
+                },
+            ]
+        }
+    )
+    messages = build_messages(
+        "context_updater",
+        recent,
+        ContextPatch,
+        context={"previous_context": UserContext.empty()},
+    )
+    payload = json.loads(messages[1]["content"])
+
+    assert payload["history"] == recent.model_dump()
+    assert payload["context"]["previous_context"] == UserContext.empty().model_dump()
+    assert "Only the latest seeker turn may change User Context" in messages[0]["content"]
+    assert (
+        "Do not infer willingness, readiness, diagnosis, or personality"
+        in messages[0]["content"]
+    )
+
+
+def test_state_and_response_roles_receive_same_context_policy(history):
+    user_context = UserContext.empty()
+    role_inputs = (
+        (
+            "multi_view_state_analyzer",
+            MultiViewStateAnalysis,
+            {"user_context": user_context},
+        ),
+        (
+            "planner",
+            StrategyPlanSet,
+            {"user_context": user_context, "state": VALID_STATE},
+        ),
+        (
+            "candidate",
+            Candidate,
+            {
+                "user_context": user_context,
+                "state": VALID_STATE,
+                "candidate_id": "1",
+                "strategy_id": "S1",
+                "strategy": "Question",
+            },
+        ),
+        (
+            "final_selector",
+            FinalSelectionDecision,
+            {
+                "user_context": user_context,
+                "state": VALID_STATE,
+                "candidates": [],
+            },
+        ),
+    )
+
+    for role, response_model, context in role_inputs:
+        system = build_messages(
+            role,
+            history,
+            response_model,
+            context=context,
+        )[0]["content"]
+        assert "User Context is factual background" in system
+        assert "the latest explicit seeker message takes priority" in system
 
 
 @pytest.mark.parametrize(
@@ -286,6 +364,7 @@ def test_selector_rejects_unknown_candidate_id(history, app_config):
 
 def test_prompt_registry_contains_only_current_roles():
     assert set(PROMPT_ROLES) == {
+        "context_updater",
         "multi_view_state_analyzer",
         "planner",
         "candidate",
@@ -293,7 +372,7 @@ def test_prompt_registry_contains_only_current_roles():
     }
 
 
-def test_teacher_configs_use_synthetic_self_disclosure_protocol():
+def test_teacher_config_uses_seeker_context_protocol():
     from ibd.config import AppConfig
 
     repository = Path(__file__).parents[1]
@@ -301,7 +380,7 @@ def test_teacher_configs_use_synthetic_self_disclosure_protocol():
         config = AppConfig.from_yaml(repository / relative_path)
         assert (
             config.protocol_version
-            == "qwen25-socialsim-seven-state-policy-neutral-v2-synthetic-self-disclosure"
+            == "qwen25-socialsim-seven-state-context-v1"
         )
 
 

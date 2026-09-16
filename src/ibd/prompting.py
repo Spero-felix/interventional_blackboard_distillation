@@ -66,6 +66,18 @@ _STATE_CONSUMING_ROLES = {
     "candidate",
     "final_selector",
 }
+_CONTEXT_CONSUMING_ROLES = {
+    "multi_view_state_analyzer",
+    "planner",
+    "candidate",
+    "final_selector",
+}
+_CONTEXT_USAGE_POLICY = (
+    "User Context is factual background, not a diagnosis or a current-state label. "
+    "Use it only when it is relevant to the current decision. For willingness, "
+    "readiness, boundaries, and immediate needs, the latest explicit seeker message "
+    "takes priority over persistent User Context."
+)
 
 
 def _prompt(**sections: str) -> str:
@@ -77,6 +89,45 @@ def _prompt(**sections: str) -> str:
 
 
 _ROLE_PROMPTS = {
+    "context_updater": _prompt(
+        Role="You are a conservative User Context updater.",
+        Objective=(
+            "Maintain factual, seeker-provided background across turns without "
+            "turning transient state judgments into persistent user attributes."
+        ),
+        **{
+            "Available Inputs": (
+                "Previous User Context with exactly nine fields and a recent "
+                "dialogue window ending in the latest seeker turn."
+            ),
+            "Responsibilities": (
+                "Return a ContextPatch with complete add, replace, and remove "
+                "sections. Every section must contain all nine Context fields."
+            ),
+            "Procedure": (
+                "Only the latest seeker turn may change User Context. Store only "
+                "facts explicitly stated by the seeker or facts that are near-literal "
+                "paraphrases. Use add for new facts, replace only when the current "
+                "turn explicitly corrects an old fact, and remove only when the seeker "
+                "explicitly retracts or invalidates an old fact."
+            ),
+            "Constraints": (
+                "Do not copy supporter claims into User Context. Do not infer "
+                "willingness, readiness, diagnosis, or personality. Do not infer "
+                "demographics, motives, hidden causes, or future behavior."
+            ),
+            "Quality Criteria": (
+                "Every operation is directly justified by the latest seeker turn, "
+                "uses the most appropriate Context field, and preserves facts that "
+                "the seeker has not corrected or retracted."
+            ),
+            "Output Contract": (
+                "Return ONLY JSON matching the supplied schema. If there is no "
+                "justified update, return empty lists in every field of add, replace, "
+                "and remove."
+            ),
+        },
+    ),
     "multi_view_state_analyzer": _prompt(
         Role="You are a seven-dimensional user-state analyzer.",
         Objective=(
@@ -273,6 +324,8 @@ def _jsonable(value: Any) -> Any:
 
 def _resolved_prompt(role: str, context: dict[str, Any]) -> str:
     prompt = _ROLE_PROMPTS[role]
+    if role in _CONTEXT_CONSUMING_ROLES:
+        prompt += f"\n\n# User Context Handling\n{_CONTEXT_USAGE_POLICY}"
     if role in _STATE_CONSUMING_ROLES:
         prompt += f"\n\n# Unknown STATE Handling\n{_UNKNOWN_STATE_POLICY}"
     if role == "multi_view_state_analyzer":

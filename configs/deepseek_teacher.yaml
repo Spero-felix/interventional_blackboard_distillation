@@ -1,4 +1,4 @@
-protocol_version: qwen25-socialsim-seven-state-policy-neutral-v2-synthetic-self-disclosure
+protocol_version: qwen25-socialsim-seven-state-context-v1
 
 backend:
   base_url_env: OPENAI_BASE_URL
@@ -13,6 +13,12 @@ default_model:
   thinking_enabled: false
 
 roles:
+  context_updater:
+    model: deepseek-v4-flash
+    temperature: 0.0
+    max_tokens: 1800
+    provider_json_mode: true
+    thinking_enabled: false
   multi_view_state_analyzer:
     model: deepseek-v4-flash
     temperature: 0.0

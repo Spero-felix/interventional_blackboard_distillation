@@ -58,6 +58,10 @@ class ScriptedBackend:
         return LLMResult(text=json.dumps(payload, ensure_ascii=False), usage={"total_tokens": 10})
 
     def _payload(self, role: str, seed: int | None):
+        if role == "context_updater":
+            from ibd.schemas import ContextPatch
+
+            return ContextPatch.empty().model_dump(mode="json")
         expert_payloads = {
             "emotion_expert": {
                 "expert": "emotion",
