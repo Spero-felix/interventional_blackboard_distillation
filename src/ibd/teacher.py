@@ -11,7 +11,9 @@ from typing import Any, Literal
 from .backend import LLMBackend, LLMResult, StructuredCaller
 from .config import AppConfig, ModelConfig
 from .context_memory import apply_context_patch
+from .conversation_schemas import DialogueMode
 from .prompting import build_messages
+from .seeding import SeedDeriver
 from .schemas import (
     CallRecord,
     Candidate,
@@ -25,6 +27,8 @@ from .schemas import (
     StrategyName,
     StrategyPlanSet,
     TeacherTrace,
+    TurnObservation,
+    TurnResponse,
     UserContext,
 )
 
@@ -178,6 +182,22 @@ class TeacherRunner:
         split: Literal["train", "dev", "test", "diagnostic_holdout"] = "train",
         context_before: UserContext | None = None,
     ) -> TeacherTrace:
+        observation = self.observe(
+            example_id,
+            history,
+            context_before=context_before,
+        )
+        response = self.respond(observation)
+        return TeacherTrace.from_parts(observation, response, split=split)
+
+    def observe(
+        self,
+        example_id: str,
+        history: History,
+        *,
+        context_before: UserContext | None = None,
+        seed_deriver: SeedDeriver | None = None,
+    ) -> TurnObservation:
         before = context_before if context_before is not None else UserContext.empty()
         records: list[CallRecord] = []
         merge_errors: list[str] = []
@@ -188,6 +208,11 @@ class TeacherRunner:
                 ContextPatch,
                 records,
                 context={"previous_context": before},
+                seed=(
+                    seed_deriver.for_call("context_updater")
+                    if seed_deriver is not None
+                    else None
+                ),
                 example_id=example_id,
             )
         except ValueError as exc:
@@ -204,29 +229,45 @@ class TeacherRunner:
             MultiViewStateAnalysis,
             records,
             context={"user_context": after},
+            seed=(
+                seed_deriver.for_call("multi_view_state_analyzer")
+                if seed_deriver is not None
+                else None
+            ),
             example_id=example_id,
         )
-        downstream = self._run_from_state(
-            history,
-            analysis.state,
-            after,
-            records,
+        return TurnObservation(
             example_id=example_id,
-        )
-        return TeacherTrace(
-            example_id=example_id,
-            split=split,
             history=history,
             context_before=before,
             context_patch=patch,
             context_after=after,
             context_merge_errors=merge_errors,
             state_analysis=analysis,
-            state=analysis.state,
+            call_records=records,
+        )
+
+    def respond(
+        self,
+        observation: TurnObservation,
+        *,
+        dialogue_mode: DialogueMode | None = None,
+        seed_deriver: SeedDeriver | None = None,
+    ) -> TurnResponse:
+        records: list[CallRecord] = []
+        downstream = self._run_from_state(
+            observation.history,
+            observation.state_analysis.state,
+            observation.context_after,
+            records,
+            example_id=observation.example_id,
+            dialogue_mode=dialogue_mode,
+            seed_deriver=seed_deriver,
+        )
+        return TurnResponse(
             plan=downstream.plan,
             candidates=downstream.candidates,
             final_selection=downstream.final_selection,
-            final_response=downstream.response,
             call_records=records,
         )
 
@@ -238,6 +279,8 @@ class TeacherRunner:
         records: list[CallRecord],
         *,
         example_id: str | None = None,
+        dialogue_mode: DialogueMode | None = None,
+        seed_deriver: SeedDeriver | None = None,
     ) -> DownstreamResult:
         context: dict[str, Any] = {
             "user_context": user_context,
@@ -249,6 +292,11 @@ class TeacherRunner:
             StrategyPlanSet,
             records,
             context=context,
+            seed=(
+                seed_deriver.for_call("planner")
+                if seed_deriver is not None
+                else None
+            ),
             example_id=example_id,
         )
         candidates = [
@@ -260,6 +308,7 @@ class TeacherRunner:
                 strategy=strategy,
                 local_index=index,
                 records=records,
+                seed_deriver=seed_deriver,
             )
             for index, strategy in enumerate(plan.strategies, start=1)
         ]
@@ -270,6 +319,7 @@ class TeacherRunner:
             candidates=candidates,
             records=records,
             example_id=example_id,
+            seed_deriver=seed_deriver,
         )
         return DownstreamResult(final_selection, plan, candidates, records)
 
@@ -283,6 +333,7 @@ class TeacherRunner:
         strategy: StrategyName,
         local_index: int,
         records: list[CallRecord],
+        seed_deriver: SeedDeriver | None = None,
     ) -> Candidate:
         strategy_id = f"S{local_index}"
         context: dict[str, Any] = {
@@ -298,6 +349,11 @@ class TeacherRunner:
             Candidate,
             records,
             context=context,
+            seed=(
+                seed_deriver.for_call("candidate", strategy_id)
+                if seed_deriver is not None
+                else None
+            ),
             example_id=example_id,
             cache_variant=strategy_id,
         )
@@ -339,6 +395,7 @@ class TeacherRunner:
         candidates: list[Candidate],
         records: list[CallRecord],
         example_id: str | None,
+        seed_deriver: SeedDeriver | None = None,
     ) -> FinalSelection:
         context: dict[str, Any] = {
             "user_context": user_context,
@@ -351,6 +408,11 @@ class TeacherRunner:
             FinalSelectionDecision,
             records,
             context=context,
+            seed=(
+                seed_deriver.for_call("final_selector")
+                if seed_deriver is not None
+                else None
+            ),
             example_id=example_id,
         )
         selected = [
@@ -382,11 +444,38 @@ class TeacherSession:
         *,
         split: Literal["train", "dev", "test", "diagnostic_holdout"] = "train",
     ) -> TeacherTrace:
-        trace = self.runner.run(
+        observation = self.observe(example_id, history)
+        return self.respond(observation, split=split)
+
+    def observe(
+        self,
+        example_id: str,
+        history: History,
+        *,
+        seed_deriver: SeedDeriver | None = None,
+    ) -> TurnObservation:
+        return self.runner.observe(
             example_id,
             history,
-            split=split,
             context_before=self.context,
+            seed_deriver=seed_deriver,
         )
+
+    def respond(
+        self,
+        observation: TurnObservation,
+        *,
+        split: Literal["train", "dev", "test", "diagnostic_holdout"] = "train",
+        dialogue_mode: DialogueMode | None = None,
+        seed_deriver: SeedDeriver | None = None,
+    ) -> TeacherTrace:
+        if observation.context_before != self.context:
+            raise ValueError("observation context does not match the current session")
+        response = self.runner.respond(
+            observation,
+            dialogue_mode=dialogue_mode,
+            seed_deriver=seed_deriver,
+        )
+        trace = TeacherTrace.from_parts(observation, response, split=split)
         self.context = trace.context_after
         return trace

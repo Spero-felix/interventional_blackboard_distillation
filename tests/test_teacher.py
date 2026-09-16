@@ -7,6 +7,7 @@ from conftest import ScriptedBackend, VALID_STATE
 from ibd.backend import LLMResult
 from ibd.config import ModelConfig
 from ibd.prompting import ESCONV_STRATEGIES, PROMPT_ROLES, build_messages
+from ibd.seeding import SeedDeriver
 from ibd.schemas import (
     Candidate,
     ContextPatch,
@@ -134,6 +135,92 @@ def test_normal_teacher_path_updates_context_then_runs_response_pipeline(
     assert trace.final_selection.selected_candidate_id == "2"
     assert trace.final_response == trace.candidates[1].response
     assert not any(role.endswith("_critic") for role in roles)
+
+
+def test_observe_and_respond_rebuild_the_legacy_run_trace(history, app_config):
+    split_backend = ScriptedBackend()
+    split_runner = TeacherRunner(split_backend, app_config)
+
+    observation = split_runner.observe("e-split", history)
+    response = split_runner.respond(observation)
+    rebuilt = TeacherTrace.from_parts(observation, response, split="train")
+    legacy = TeacherRunner(ScriptedBackend(), app_config).run("e-split", history)
+
+    assert rebuilt == legacy
+    assert [call["role"] for call in split_backend.calls] == list(NORMAL_ROLES)
+
+
+def test_observe_and_respond_own_disjoint_teacher_stages(history, app_config):
+    backend = ScriptedBackend()
+    runner = TeacherRunner(backend, app_config)
+
+    observation = runner.observe("e-stages", history)
+    assert [call["role"] for call in backend.calls] == [
+        "context_updater",
+        "multi_view_state_analyzer",
+    ]
+
+    runner.respond(observation)
+    assert [call["role"] for call in backend.calls[2:]] == [
+        "planner",
+        "candidate",
+        "candidate",
+        "candidate",
+        "final_selector",
+    ]
+
+
+def test_teacher_session_commits_context_only_after_response_succeeds(
+    history,
+    app_config,
+):
+    patch_payload = ContextPatch.empty().model_dump(mode="json")
+    patch_payload["add"]["active_concerns"] = ["担心答辩"]
+
+    class TogglePlannerBackend(ContextAwareScriptedBackend):
+        fail_planner = True
+
+        def _payload(self, role, seed):
+            if role == "planner" and self.fail_planner:
+                return {"strategies": []}
+            return super()._payload(role, seed)
+
+    backend = TogglePlannerBackend(ContextPatch.model_validate(patch_payload))
+    session = TeacherSession(TeacherRunner(backend, app_config))
+    observation = session.observe("e-transaction", history)
+
+    with pytest.raises(ValueError, match="planner failed schema validation"):
+        session.respond(observation)
+    assert session.context == UserContext.empty()
+
+    backend.fail_planner = False
+    trace = session.respond(observation)
+    assert session.context == observation.context_after
+    assert trace.context_after.active_concerns == ["担心答辩"]
+
+
+def test_split_teacher_uses_stable_role_and_candidate_seeds(history, app_config):
+    backend = ScriptedBackend()
+    runner = TeacherRunner(backend, app_config)
+    seeds = SeedDeriver("protocol-v1", "profile-1-seed-42", 42, 1)
+
+    observation = runner.observe("profile-1-seed-42:round:1", history, seed_deriver=seeds)
+    runner.respond(observation, seed_deriver=seeds)
+
+    calls_by_role = {}
+    for call in backend.calls:
+        calls_by_role.setdefault(call["role"], []).append(call["seed"])
+    assert calls_by_role["context_updater"] == [seeds.for_call("context_updater")]
+    assert calls_by_role["multi_view_state_analyzer"] == [
+        seeds.for_call("multi_view_state_analyzer")
+    ]
+    assert calls_by_role["planner"] == [seeds.for_call("planner")]
+    assert calls_by_role["candidate"] == [
+        seeds.for_call("candidate", "S1"),
+        seeds.for_call("candidate", "S2"),
+        seeds.for_call("candidate", "S3"),
+    ]
+    assert calls_by_role["final_selector"] == [seeds.for_call("final_selector")]
 
 
 def test_teacher_updates_context_before_state_and_passes_it_downstream(
