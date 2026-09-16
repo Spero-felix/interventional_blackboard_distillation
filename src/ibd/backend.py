@@ -33,6 +33,15 @@ class EmptyContentError(RuntimeError):
     """Raised when a provider completes successfully without response text."""
 
 
+class StructuredCallError(ValueError):
+    """Schema-validation failure with all model outputs retained for audit."""
+
+    def __init__(self, role: str, records: list[CallRecord]):
+        super().__init__(f"{role} failed schema validation")
+        self.role = role
+        self.records = tuple(records)
+
+
 class LLMBackend(Protocol):
     def complete(
         self,
@@ -108,28 +117,29 @@ class OpenAIBackend:
         return LLMResult(text=content, usage=usage)
 
 
-class StructuredCaller:
-    def __init__(self, backend: LLMBackend, config: AppConfig):
-        self.backend = backend
+class CallCache:
+    """Protocol-namespaced raw payload cache shared by caller implementations."""
+
+    def __init__(self, config: AppConfig):
         self.config = config
         self._memory_cache: dict[str, dict[str, Any]] = {}
         protocol = config.model_dump(mode="json", exclude={"backend": {"cache_dir"}})
         protocol["backend"]["resolved_base_url"] = config.backend.resolve_base_url()
-        self._cache_namespace = _cache_digest(protocol)
+        self.namespace = _cache_digest(protocol)
 
-    def _cache_key(
+    def key(
         self,
         example_id: str,
         role: str,
         cache_variant: str | None = None,
     ) -> str:
         if cache_variant is None:
-            return _cache_digest((example_id, role, self._cache_namespace))
+            return _cache_digest((example_id, role, self.namespace))
         return _cache_digest(
-            (example_id, role, cache_variant, self._cache_namespace)
+            (example_id, role, cache_variant, self.namespace)
         )
 
-    def _cache_path(self, key: str, *, failure: bool = False) -> Path | None:
+    def path(self, key: str, *, failure: bool = False) -> Path | None:
         if self.config.backend.cache_dir is None:
             return None
         folder = "failures" if failure else "calls"
@@ -155,18 +165,62 @@ class StructuredCaller:
             if os.path.exists(temporary):
                 os.unlink(temporary)
 
-    def _read_cached(
-        self,
-        key: str,
-        response_model: type[T],
-    ) -> tuple[T, CallRecord] | None:
+    def read(self, key: str) -> dict[str, Any] | None:
         payload = self._memory_cache.get(key)
-        path = self._cache_path(key)
+        path = self.path(key)
         if payload is None and path is not None and path.is_file():
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 return None
+        if not isinstance(payload, dict):
+            return None
+        self._memory_cache[key] = payload
+        return payload
+
+    def write(
+        self,
+        key: str,
+        payload: dict[str, Any],
+        *,
+        failure: bool = False,
+    ) -> None:
+        if not failure:
+            self._memory_cache[key] = payload
+        path = self.path(key, failure=failure)
+        if path is not None:
+            self._atomic_json(path, payload)
+
+
+class StructuredCaller:
+    def __init__(self, backend: LLMBackend, config: AppConfig):
+        self.backend = backend
+        self.config = config
+        self.cache = CallCache(config)
+        self._memory_cache = self.cache._memory_cache
+        self._cache_namespace = self.cache.namespace
+
+    def _cache_key(
+        self,
+        example_id: str,
+        role: str,
+        cache_variant: str | None = None,
+    ) -> str:
+        return self.cache.key(example_id, role, cache_variant)
+
+    def _cache_path(self, key: str, *, failure: bool = False) -> Path | None:
+        return self.cache.path(key, failure=failure)
+
+    @staticmethod
+    def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+        CallCache._atomic_json(path, payload)
+
+    def _read_cached(
+        self,
+        key: str,
+        response_model: type[T],
+    ) -> tuple[T, CallRecord] | None:
+        payload = self.cache.read(key)
         if payload is None:
             return None
         try:
@@ -176,7 +230,6 @@ class StructuredCaller:
             )
         except (KeyError, TypeError, ValidationError):
             return None
-        self._memory_cache[key] = payload
         return parsed, record
 
     def call(
@@ -285,21 +338,16 @@ class StructuredCaller:
                 }
                 if cache_variant is not None:
                     cache_payload["cache_variant"] = cache_variant
-                self._memory_cache[cache_key] = cache_payload
-                path = self._cache_path(cache_key)
-                if path is not None:
-                    self._atomic_json(path, cache_payload)
+                self.cache.write(cache_key, cache_payload)
             return parsed, records
         if cache_key is not None:
-            path = self._cache_path(cache_key, failure=True)
-            if path is not None:
-                failure_payload = {
-                    "example_id": example_id,
-                    "role": role,
-                    "records": [record.model_dump(mode="json") for record in records],
-                    "error": str(last_error),
-                }
-                if cache_variant is not None:
-                    failure_payload["cache_variant"] = cache_variant
-                self._atomic_json(path, failure_payload)
-        raise ValueError(f"{role} failed schema validation") from last_error
+            failure_payload = {
+                "example_id": example_id,
+                "role": role,
+                "records": [record.model_dump(mode="json") for record in records],
+                "error": str(last_error),
+            }
+            if cache_variant is not None:
+                failure_payload["cache_variant"] = cache_variant
+            self.cache.write(cache_key, failure_payload, failure=True)
+        raise StructuredCallError(role, records) from last_error
