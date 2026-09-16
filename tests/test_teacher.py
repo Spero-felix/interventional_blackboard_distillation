@@ -701,6 +701,14 @@ def test_teacher_config_uses_seeker_context_protocol():
             config.protocol_version
             == "qwen25-socialsim-seven-state-context-v1"
         )
+        seeker = config.roles["seeker_simulator"]
+        assert seeker.temperature == 0.7
+        assert seeker.max_tokens == 256
+        assert seeker.provider_json_mode is False
+        manager = config.roles["dialogue_manager"]
+        assert manager.temperature == 0.0
+        assert manager.max_tokens == 256
+        assert manager.provider_json_mode is True
 
 
 def test_plain_text_candidate_provider_is_wrapped(history):

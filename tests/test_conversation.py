@@ -9,7 +9,11 @@ from ibd.conversation import (
     ConversationStageError,
     flatten_teacher_traces,
 )
-from ibd.conversation_schemas import ConversationCheckpoint, ConversationGenerationConfig
+from ibd.conversation_schemas import (
+    ConversationCheckpoint,
+    ConversationGenerationConfig,
+    ConversationTrace,
+)
 from ibd.dialogue_manager import DialogueManager
 from ibd.schemas import DialogueTurn
 from ibd.seeker import MappingProfileAdapter, SeekerSimulator
@@ -305,3 +309,54 @@ def test_resume_after_persisted_round_matches_uninterrupted_generation(
         "round:1" not in json.dumps(call["messages"], ensure_ascii=False)
         for call in resumed_backend.calls
     )
+
+
+def test_private_profile_sentinel_reaches_only_seeker_messages(app_config):
+    sentinel = "PRIVATE_PROFILE_SENTINEL"
+    backend = ConversationBackend(["closing"])
+    checkpoints = []
+    private_profile = MappingProfileAdapter().validate(
+        {"ID": "profile-private", "Situation": sentinel}
+    )
+
+    trace = _generator(backend, app_config).generate(
+        private_profile,
+        base_seed=42,
+        on_round_completed=checkpoints.append,
+    )
+
+    seeker_calls = [call for call in backend.calls if call["role"] == "seeker_simulator"]
+    supporter_side_calls = [
+        call for call in backend.calls if call["role"] != "seeker_simulator"
+    ]
+    assert sentinel in json.dumps(seeker_calls, ensure_ascii=False)
+    assert sentinel not in json.dumps(supporter_side_calls, ensure_ascii=False)
+    assert sentinel not in trace.model_dump_json()
+    assert sentinel not in checkpoints[-1].model_dump_json()
+    assert all(sentinel not in item.model_dump_json() for item in flatten_teacher_traces(trace))
+
+
+def test_conversation_schema_has_no_private_or_parallel_audit_fields():
+    forbidden = {
+        "private_state",
+        "profile",
+        "profile_payload",
+        "dialogue_goal",
+        "should_close",
+        "supporter_traces",
+        "dialogue_decisions",
+    }
+    discovered = set()
+
+    def collect_property_names(node):
+        if isinstance(node, dict):
+            discovered.update(node.get("properties", {}))
+            for value in node.values():
+                collect_property_names(value)
+        elif isinstance(node, list):
+            for value in node:
+                collect_property_names(value)
+
+    collect_property_names(ConversationTrace.model_json_schema())
+
+    assert forbidden.isdisjoint(discovered)
