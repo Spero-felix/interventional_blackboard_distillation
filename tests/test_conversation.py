@@ -9,11 +9,12 @@ from ibd.conversation import (
     ConversationStageError,
     flatten_teacher_traces,
 )
-from ibd.conversation_schemas import ConversationGenerationConfig
+from ibd.conversation_schemas import ConversationCheckpoint, ConversationGenerationConfig
 from ibd.dialogue_manager import DialogueManager
 from ibd.schemas import DialogueTurn
 from ibd.seeker import MappingProfileAdapter, SeekerSimulator
 from ibd.teacher import TeacherRunner
+from ibd.storage import read_json, write_json_atomic
 
 
 class ConversationBackend(ScriptedBackend):
@@ -28,6 +29,7 @@ class ConversationBackend(ScriptedBackend):
             raise RuntimeError(f"simulated {role} failure")
         if role == "seeker_simulator":
             self.seeker_index += 1
+            round_index = json.loads(messages[1]["content"])["round_index"]
             self.calls.append(
                 {
                     "role": role,
@@ -37,7 +39,7 @@ class ConversationBackend(ScriptedBackend):
                     "seed": seed,
                 }
             )
-            return LLMResult(text=f"第{self.seeker_index}轮，我想继续说说。")
+            return LLMResult(text=f"第{round_index}轮，我想继续说说。")
         if role == "dialogue_manager":
             mode = self.manager_modes.pop(0)
             self.calls.append(
@@ -266,3 +268,40 @@ def test_generator_rejects_control_characters_in_profile_id(app_config):
         _generator(ConversationBackend(["closing"]), app_config).generate(
             profile, base_seed=42
         )
+
+
+def test_resume_after_persisted_round_matches_uninterrupted_generation(
+    tmp_path,
+    app_config,
+):
+    uninterrupted = _generator(
+        ConversationBackend(["exploration", "closing"]), app_config
+    ).generate(_profile(), base_seed=42)
+    checkpoint_path = tmp_path / "checkpoint.json"
+
+    def persist_then_interrupt(checkpoint):
+        write_json_atomic(checkpoint_path, checkpoint)
+        if len(checkpoint.rounds) == 1:
+            raise RuntimeError("simulated interruption")
+
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        _generator(
+            ConversationBackend(["exploration", "closing"]), app_config
+        ).generate(
+            _profile(),
+            base_seed=42,
+            on_round_completed=persist_then_interrupt,
+        )
+
+    stored = ConversationCheckpoint.model_validate(read_json(checkpoint_path))
+    resumed_backend = ConversationBackend(["closing"])
+    resumed = _generator(resumed_backend, app_config).generate(
+        _profile(), base_seed=42, checkpoint=stored
+    )
+
+    assert resumed == uninterrupted
+    assert [call["role"] for call in resumed_backend.calls].count("seeker_simulator") == 1
+    assert all(
+        "round:1" not in json.dumps(call["messages"], ensure_ascii=False)
+        for call in resumed_backend.calls
+    )
