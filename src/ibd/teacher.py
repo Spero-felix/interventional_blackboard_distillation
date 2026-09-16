@@ -10,10 +10,12 @@ from typing import Any, Literal
 
 from .backend import LLMBackend, LLMResult, StructuredCaller
 from .config import AppConfig, ModelConfig
+from .context_memory import apply_context_patch
 from .prompting import build_messages
 from .schemas import (
     CallRecord,
     Candidate,
+    ContextPatch,
     FinalSelection,
     FinalSelectionDecision,
     History,
@@ -23,9 +25,11 @@ from .schemas import (
     StrategyName,
     StrategyPlanSet,
     TeacherTrace,
+    UserContext,
 )
 
 NORMAL_ROLES = (
+    "context_updater",
     "multi_view_state_analyzer",
     "planner",
     "candidate",
@@ -119,6 +123,13 @@ class DownstreamResult:
         return self.final_selection.response
 
 
+def _recent_context_history(history: History) -> History:
+    turns = [history.turns[-1]]
+    if len(history.turns) > 1 and history.turns[-2].role == "supporter":
+        turns.insert(0, history.turns[-2])
+    return History(turns=turns)
+
+
 class TeacherRunner:
     def __init__(self, backend: LLMBackend, config: AppConfig):
         self.config = config
@@ -165,22 +176,51 @@ class TeacherRunner:
         history: History,
         *,
         split: Literal["train", "dev", "test", "diagnostic_holdout"] = "train",
+        context_before: UserContext | None = None,
     ) -> TeacherTrace:
+        before = context_before if context_before is not None else UserContext.empty()
         records: list[CallRecord] = []
+        merge_errors: list[str] = []
+        try:
+            patch = self._call(
+                "context_updater",
+                _recent_context_history(history),
+                ContextPatch,
+                records,
+                context={"previous_context": before},
+                example_id=example_id,
+            )
+        except ValueError as exc:
+            patch = ContextPatch.empty()
+            merge_errors.append(f"context_updater_failed: {exc}")
+
+        merge_result = apply_context_patch(before, patch)
+        after = merge_result.context
+        merge_errors.extend(merge_result.errors)
+
         analysis = self._call(
             "multi_view_state_analyzer",
             history,
             MultiViewStateAnalysis,
             records,
+            context={"user_context": after},
             example_id=example_id,
         )
         downstream = self._run_from_state(
-            history, analysis.state, records, example_id=example_id
+            history,
+            analysis.state,
+            after,
+            records,
+            example_id=example_id,
         )
         return TeacherTrace(
             example_id=example_id,
             split=split,
             history=history,
+            context_before=before,
+            context_patch=patch,
+            context_after=after,
+            context_merge_errors=merge_errors,
             state_analysis=analysis,
             state=analysis.state,
             plan=downstream.plan,
@@ -194,11 +234,15 @@ class TeacherRunner:
         self,
         history: History,
         state: StateBlackboard,
+        user_context: UserContext,
         records: list[CallRecord],
         *,
         example_id: str | None = None,
     ) -> DownstreamResult:
-        context: dict[str, Any] = {"state": state}
+        context: dict[str, Any] = {
+            "user_context": user_context,
+            "state": state,
+        }
         plan = self._call(
             "planner",
             history,
@@ -212,6 +256,7 @@ class TeacherRunner:
                 example_id=example_id,
                 history=history,
                 state=state,
+                user_context=user_context,
                 strategy=strategy,
                 local_index=index,
                 records=records,
@@ -221,6 +266,7 @@ class TeacherRunner:
         final_selection = self._run_final_selector(
             history=history,
             state=state,
+            user_context=user_context,
             candidates=candidates,
             records=records,
             example_id=example_id,
@@ -233,12 +279,14 @@ class TeacherRunner:
         example_id: str | None,
         history: History,
         state: StateBlackboard,
+        user_context: UserContext,
         strategy: StrategyName,
         local_index: int,
         records: list[CallRecord],
     ) -> Candidate:
         strategy_id = f"S{local_index}"
         context: dict[str, Any] = {
+            "user_context": user_context,
             "state": state,
             "candidate_id": str(local_index),
             "strategy_id": strategy_id,
@@ -287,11 +335,13 @@ class TeacherRunner:
         *,
         history: History,
         state: StateBlackboard,
+        user_context: UserContext,
         candidates: list[Candidate],
         records: list[CallRecord],
         example_id: str | None,
     ) -> FinalSelection:
         context: dict[str, Any] = {
+            "user_context": user_context,
             "state": state,
             "candidates": self._selector_candidates(candidates, example_id),
         }
@@ -311,3 +361,32 @@ class TeacherRunner:
         if len(selected) != 1:
             raise ValueError("final_selector must identify exactly one supplied candidate")
         return FinalSelection.from_candidate(selected[0], decision)
+
+
+class TeacherSession:
+    """Carries factual User Context across seeker turns."""
+
+    def __init__(
+        self,
+        runner: TeacherRunner,
+        *,
+        context: UserContext | None = None,
+    ) -> None:
+        self.runner = runner
+        self.context = context if context is not None else UserContext.empty()
+
+    def run(
+        self,
+        example_id: str,
+        history: History,
+        *,
+        split: Literal["train", "dev", "test", "diagnostic_holdout"] = "train",
+    ) -> TeacherTrace:
+        trace = self.runner.run(
+            example_id,
+            history,
+            split=split,
+            context_before=self.context,
+        )
+        self.context = trace.context_after
+        return trace

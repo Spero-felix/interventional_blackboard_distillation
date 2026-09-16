@@ -14,9 +14,15 @@ from ibd.schemas import (
     History,
     MultiViewStateAnalysis,
     StrategyPlanSet,
+    TeacherTrace,
     UserContext,
 )
-from ibd.teacher import NORMAL_ROLES, TeacherRunner, _PlainTextCandidateBackend
+from ibd.teacher import (
+    NORMAL_ROLES,
+    TeacherRunner,
+    TeacherSession,
+    _PlainTextCandidateBackend,
+)
 
 
 UNKNOWN_STATE_POLICY = (
@@ -46,7 +52,75 @@ def candidate_adapter(text):
     )
 
 
-def test_normal_teacher_path_is_one_analyzer_three_candidates_one_selector(
+class ContextAwareScriptedBackend(ScriptedBackend):
+    def __init__(self, updater_patch: ContextPatch) -> None:
+        super().__init__()
+        self.updater_patch = updater_patch
+
+    def _payload(self, role: str, seed: int | None):
+        if role == "context_updater":
+            return self.updater_patch.model_dump(mode="json")
+        return super()._payload(role, seed)
+
+    def user_payloads(self, role: str) -> list[dict[str, object]]:
+        return [
+            json.loads(call["messages"][1]["content"])
+            for call in self.calls
+            if call["role"] == role
+        ]
+
+
+class InvalidUpdaterThenValidTeacherBackend(ScriptedBackend):
+    def complete(
+        self,
+        *,
+        role,
+        messages,
+        model_config,
+        json_mode=True,
+        seed=None,
+    ):
+        if role != "context_updater":
+            return super().complete(
+                role=role,
+                messages=messages,
+                model_config=model_config,
+                json_mode=json_mode,
+                seed=seed,
+            )
+        self.calls.append(
+            {
+                "role": role,
+                "messages": messages,
+                "model": model_config.model,
+                "json_mode": json_mode,
+                "seed": seed,
+            }
+        )
+        return LLMResult(text="{", usage={"total_tokens": 1})
+
+
+class SequentialContextBackend(ContextAwareScriptedBackend):
+    def __init__(self) -> None:
+        super().__init__(ContextPatch.empty())
+        self.update_index = 0
+
+    def _payload(self, role: str, seed: int | None):
+        if role != "context_updater":
+            return ScriptedBackend._payload(self, role, seed)
+
+        self.update_index += 1
+        payload = ContextPatch.empty().model_dump(mode="json")
+        if self.update_index == 1:
+            payload["add"]["active_concerns"] = ["担心答辩"]
+        else:
+            payload["replace"]["active_concerns"] = [
+                {"old": "担心答辩", "new": "担心明天答辩卡住"}
+            ]
+        return payload
+
+
+def test_normal_teacher_path_updates_context_then_runs_response_pipeline(
     history, app_config
 ):
     backend = ScriptedBackend()
@@ -60,6 +134,163 @@ def test_normal_teacher_path_is_one_analyzer_three_candidates_one_selector(
     assert trace.final_selection.selected_candidate_id == "2"
     assert trace.final_response == trace.candidates[1].response
     assert not any(role.endswith("_critic") for role in roles)
+
+
+def test_teacher_updates_context_before_state_and_passes_it_downstream(
+    history,
+    app_config,
+):
+    patch_payload = ContextPatch.empty().model_dump()
+    patch_payload["add"]["support_preferences_and_boundaries"] = [
+        "当前不想听长期建议"
+    ]
+    backend = ContextAwareScriptedBackend(
+        ContextPatch.model_validate(patch_payload)
+    )
+    trace = TeacherRunner(backend, app_config).run(
+        "e-context", history, split="train"
+    )
+
+    assert [call["role"] for call in backend.calls] == list(NORMAL_ROLES)
+    assert trace.context_before == UserContext.empty()
+    assert trace.context_after.support_preferences_and_boundaries == [
+        "当前不想听长期建议"
+    ]
+    downstream_payloads = [
+        json.loads(call["messages"][1]["content"])
+        for call in backend.calls
+        if call["role"]
+        in {
+            "multi_view_state_analyzer",
+            "planner",
+            "candidate",
+            "final_selector",
+        }
+    ]
+    assert len(downstream_payloads) == 6
+    assert all(
+        payload["context"]["user_context"] == trace.context_after.model_dump()
+        for payload in downstream_payloads
+    )
+
+
+def test_context_updater_sees_only_last_supporter_and_latest_seeker_turn(
+    history,
+    app_config,
+):
+    backend = ContextAwareScriptedBackend(ContextPatch.empty())
+
+    TeacherRunner(backend, app_config).run("e-window", history)
+
+    updater_history = backend.user_payloads("context_updater")[0]["history"]["turns"]
+    assert updater_history == history.model_dump()["turns"][-2:]
+    assert updater_history[-1]["role"] == "seeker"
+
+
+def test_context_updater_omits_an_unpaired_previous_seeker(app_config):
+    history = History.model_validate(
+        {
+            "turns": [
+                {"role": "seeker", "content": "昨天我也很担心。"},
+                {"role": "seeker", "content": "现在我只想说今天的事。"},
+            ]
+        }
+    )
+    backend = ContextAwareScriptedBackend(ContextPatch.empty())
+
+    TeacherRunner(backend, app_config).run("e-unpaired", history)
+
+    assert backend.user_payloads("context_updater")[0]["history"]["turns"] == [
+        history.model_dump()["turns"][-1]
+    ]
+
+
+def test_first_seeker_turn_is_a_valid_context_update_window(app_config):
+    history = History.model_validate(
+        {"turns": [{"role": "seeker", "content": "我今天完全睡不着。"}]}
+    )
+    backend = ContextAwareScriptedBackend(ContextPatch.empty())
+
+    TeacherRunner(backend, app_config).run("e-first", history)
+
+    assert backend.user_payloads("context_updater")[0]["history"] == history.model_dump()
+
+
+def test_context_updater_failure_preserves_previous_context_and_continues(
+    history,
+    app_config,
+):
+    previous_payload = UserContext.empty().model_dump()
+    previous_payload["active_concerns"] = ["担心答辩"]
+    previous = UserContext.model_validate(previous_payload)
+    backend = InvalidUpdaterThenValidTeacherBackend()
+
+    trace = TeacherRunner(backend, app_config).run(
+        "e-invalid-updater",
+        history,
+        context_before=previous,
+    )
+
+    assert trace.context_patch == ContextPatch.empty()
+    assert trace.context_after == previous
+    assert trace.context_merge_errors == [
+        "context_updater_failed: context_updater failed schema validation"
+    ]
+    assert trace.final_response
+
+
+def test_teacher_session_carries_context_between_seeker_turns(app_config):
+    backend = SequentialContextBackend()
+    session = TeacherSession(TeacherRunner(backend, app_config))
+    first_history = History.model_validate(
+        {"turns": [{"role": "seeker", "content": "我有点担心答辩。"}]}
+    )
+    second_history = History.model_validate(
+        {
+            "turns": [
+                {"role": "seeker", "content": "我有点担心答辩。"},
+                {"role": "supporter", "content": "最担心哪个部分？"},
+                {
+                    "role": "seeker",
+                    "content": "更准确地说，我担心明天答辩时卡住。",
+                },
+            ]
+        }
+    )
+
+    first = session.run("turn-1", first_history)
+    second = session.run("turn-2", second_history)
+
+    assert first.context_before == UserContext.empty()
+    assert second.context_before == first.context_after
+    assert second.context_after.active_concerns == ["担心明天答辩卡住"]
+    assert session.context == second.context_after
+    assert backend.user_payloads("context_updater")[1]["context"][
+        "previous_context"
+    ] == first.context_after.model_dump()
+
+
+def test_legacy_teacher_trace_defaults_to_empty_context_audit(
+    history,
+    app_config,
+):
+    payload = TeacherRunner(ScriptedBackend(), app_config).run(
+        "legacy", history
+    ).model_dump(mode="json")
+    for field in (
+        "context_before",
+        "context_patch",
+        "context_after",
+        "context_merge_errors",
+    ):
+        payload.pop(field)
+
+    trace = TeacherTrace.model_validate(payload)
+
+    assert trace.context_before == UserContext.empty()
+    assert trace.context_patch == ContextPatch.empty()
+    assert trace.context_after == UserContext.empty()
+    assert trace.context_merge_errors == []
 
 
 def test_normal_teacher_uses_one_candidate_role_without_provider_seeds(
