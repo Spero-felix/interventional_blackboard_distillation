@@ -4,7 +4,7 @@ import pytest
 import yaml
 
 from conftest import ScriptedBackend
-from ibd.schemas import ContextPatch, UserContext
+from ibd.schemas import ContextPatch, TeacherTrace, UserContext
 from ibd.storage import read_jsonl, write_jsonl
 from ibd.teacher import TeacherRunner
 
@@ -35,6 +35,58 @@ def _write_config(path):
         yaml.safe_dump({"default_model": {"model": "fake-model"}}),
         encoding="utf-8",
     )
+
+
+class BatchConversationBackend(ScriptedBackend):
+    def __init__(self):
+        super().__init__()
+        self.active_profile = None
+
+    def complete(self, *, role, messages, model_config, json_mode=True, seed=None):
+        from ibd.backend import LLMResult
+
+        if role == "seeker_simulator":
+            rendered = messages[1]["content"]
+            for profile_id in ("p-complete", "p-truncated", "p-fail"):
+                if profile_id in rendered:
+                    self.active_profile = profile_id
+                    break
+            self.calls.append(
+                {
+                    "role": role,
+                    "messages": messages,
+                    "model": model_config.model,
+                    "json_mode": json_mode,
+                    "seed": seed,
+                }
+            )
+            if self.active_profile == "p-fail":
+                raise RuntimeError("simulated seeker provider failure")
+            return LLMResult(text="我想谈谈最近的压力。")
+        if role == "dialogue_manager":
+            self.calls.append(
+                {
+                    "role": role,
+                    "messages": messages,
+                    "model": model_config.model,
+                    "json_mode": json_mode,
+                    "seed": seed,
+                }
+            )
+            mode = "closing" if self.active_profile == "p-complete" else "exploration"
+            return LLMResult(
+                text=json.dumps(
+                    {"mode": mode, "transition_reason": f"选择 {mode}"},
+                    ensure_ascii=False,
+                )
+            )
+        return super().complete(
+            role=role,
+            messages=messages,
+            model_config=model_config,
+            json_mode=json_mode,
+            seed=seed,
+        )
 
 
 def test_validate_trace_accepts_a_complete_teacher_trace(
@@ -660,3 +712,246 @@ def test_prepare_socialsim_cli_writes_reproducible_artifact(tmp_path):
         for row in rows
     )
     assert "SECRET" not in output.read_text(encoding="utf-8")
+
+
+def _conversation_cli_paths(tmp_path):
+    return {
+        "output": tmp_path / "conversations.jsonl",
+        "truncated": tmp_path / "truncated-conversations.jsonl",
+        "failures": tmp_path / "conversation-failures.jsonl",
+        "checkpoints": tmp_path / "checkpoints",
+    }
+
+
+def _conversation_cli_args(config_path, profiles_path, paths, *extra):
+    return [
+        "generate-conversations",
+        "--config",
+        str(config_path),
+        "--profiles",
+        str(profiles_path),
+        "--output",
+        str(paths["output"]),
+        "--truncated",
+        str(paths["truncated"]),
+        "--failures",
+        str(paths["failures"]),
+        "--checkpoint-dir",
+        str(paths["checkpoints"]),
+        "--seed",
+        "42",
+        *extra,
+    ]
+
+
+def test_generate_conversations_parser_exposes_dynamic_round_defaults():
+    from ibd.cli import _build_parser
+
+    args = _build_parser().parse_args(
+        [
+            "generate-conversations",
+            "--config",
+            "config.yaml",
+            "--profiles",
+            "profiles.json",
+            "--output",
+            "conversations.jsonl",
+            "--truncated",
+            "truncated.jsonl",
+            "--failures",
+            "failures.jsonl",
+            "--checkpoint-dir",
+            "checkpoints",
+            "--seed",
+            "42",
+        ]
+    )
+
+    assert args.min_rounds == 6
+    assert args.soft_max_rounds == 16
+    assert args.hard_max_rounds == 20
+    assert args.split == "train"
+    assert args.resume is False
+
+
+def test_generate_conversations_routes_completed_truncated_and_failure_records(
+    tmp_path,
+    monkeypatch,
+):
+    import ibd.cli as cli
+
+    config_path = tmp_path / "config.yaml"
+    profiles_path = tmp_path / "profiles.json"
+    paths = _conversation_cli_paths(tmp_path)
+    _write_config(config_path)
+    profiles_path.write_text(
+        json.dumps(
+            [
+                {"ID": "p-complete", "Situation": "complete"},
+                {"ID": "p-truncated", "Situation": "truncate"},
+                {"ID": "p-fail", "Situation": "failure"},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    backend = BatchConversationBackend()
+    monkeypatch.setattr(cli, "OpenAIBackend", lambda config: backend)
+
+    result = cli.main(
+        _conversation_cli_args(
+            config_path,
+            profiles_path,
+            paths,
+            "--min-rounds",
+            "1",
+            "--soft-max-rounds",
+            "1",
+            "--hard-max-rounds",
+            "1",
+        )
+    )
+
+    assert result == 1
+    completed = read_jsonl(paths["output"])
+    truncated = read_jsonl(paths["truncated"])
+    failures = read_jsonl(paths["failures"])
+    assert [(row["profile_id"], row["status"]) for row in completed] == [
+        ("p-complete", "completed")
+    ]
+    assert [(row["profile_id"], row["status"]) for row in truncated] == [
+        ("p-truncated", "truncated")
+    ]
+    assert failures == [
+        {
+            "checkpoint_path": None,
+            "completed_rounds": 0,
+            "conversation_id": "p-fail-seed-42",
+            "error": (
+                "conversation generation failed during seeker_simulator "
+                "after 0 complete rounds"
+            ),
+            "error_type": "ConversationStageError",
+            "failed_stage": "seeker_simulator",
+            "profile_id": "p-fail",
+            "seed": 42,
+        }
+    ]
+    assert len(list(paths["checkpoints"].glob("*.json"))) == 2
+
+
+def test_generate_conversations_resume_skips_finalized_outputs(tmp_path, monkeypatch):
+    import ibd.cli as cli
+
+    config_path = tmp_path / "config.yaml"
+    profiles_path = tmp_path / "profiles.json"
+    paths = _conversation_cli_paths(tmp_path)
+    _write_config(config_path)
+    profiles_path.write_text(
+        json.dumps(
+            [
+                {"ID": "p-complete", "Situation": "complete"},
+                {"ID": "p-truncated", "Situation": "truncate"},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    first_backend = BatchConversationBackend()
+    monkeypatch.setattr(cli, "OpenAIBackend", lambda config: first_backend)
+    args = _conversation_cli_args(
+        config_path,
+        profiles_path,
+        paths,
+        "--min-rounds",
+        "1",
+        "--soft-max-rounds",
+        "1",
+        "--hard-max-rounds",
+        "1",
+    )
+    assert cli.main(args) == 0
+
+    replay_backend = BatchConversationBackend()
+    monkeypatch.setattr(cli, "OpenAIBackend", lambda config: replay_backend)
+    assert cli.main([*args, "--resume"]) == 0
+
+    assert replay_backend.calls == []
+    assert len(read_jsonl(paths["output"])) == 1
+    assert len(read_jsonl(paths["truncated"])) == 1
+
+
+def test_generate_conversations_rejects_existing_outputs_without_resume(
+    tmp_path,
+):
+    import ibd.cli as cli
+
+    config_path = tmp_path / "config.yaml"
+    profiles_path = tmp_path / "profiles.json"
+    paths = _conversation_cli_paths(tmp_path)
+    _write_config(config_path)
+    profiles_path.write_text(json.dumps([{"ID": "p-complete"}]), encoding="utf-8")
+    paths["output"].write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="--resume"):
+        cli.main(_conversation_cli_args(config_path, profiles_path, paths))
+
+
+def test_generate_conversations_rejects_duplicate_normalized_profile_ids(
+    tmp_path,
+    monkeypatch,
+):
+    import ibd.cli as cli
+
+    config_path = tmp_path / "config.yaml"
+    profiles_path = tmp_path / "profiles.json"
+    paths = _conversation_cli_paths(tmp_path)
+    _write_config(config_path)
+    profiles_path.write_text(
+        json.dumps([{"ID": " duplicate "}, {"ID": "duplicate"}]),
+        encoding="utf-8",
+    )
+    backend = BatchConversationBackend()
+    monkeypatch.setattr(cli, "OpenAIBackend", lambda config: backend)
+
+    with pytest.raises(ValueError, match="duplicate profile ID: duplicate"):
+        cli.main(_conversation_cli_args(config_path, profiles_path, paths))
+    assert backend.calls == []
+
+
+def test_flatten_conversations_writes_teacher_trace_rows(tmp_path, monkeypatch):
+    import ibd.cli as cli
+
+    config_path = tmp_path / "config.yaml"
+    profiles_path = tmp_path / "profiles.json"
+    paths = _conversation_cli_paths(tmp_path)
+    flattened_path = tmp_path / "teacher-traces.jsonl"
+    _write_config(config_path)
+    profiles_path.write_text(json.dumps([{"ID": "p-complete"}]), encoding="utf-8")
+    monkeypatch.setattr(cli, "OpenAIBackend", lambda config: BatchConversationBackend())
+    assert cli.main(
+        _conversation_cli_args(
+            config_path,
+            profiles_path,
+            paths,
+            "--min-rounds",
+            "1",
+            "--soft-max-rounds",
+            "1",
+            "--hard-max-rounds",
+            "1",
+        )
+    ) == 0
+
+    assert cli.main(
+        [
+            "flatten-conversations",
+            "--input",
+            str(paths["output"]),
+            "--output",
+            str(flattened_path),
+        ]
+    ) == 0
+
+    rows = read_jsonl(flattened_path)
+    assert len(rows) == 1
+    assert rows[0]["example_id"] == "p-complete-seed-42:round:1"
+    TeacherTrace.model_validate(rows[0])
