@@ -684,6 +684,7 @@ def test_prompt_registry_contains_only_current_roles():
     assert set(PROMPT_ROLES) == {
         "context_updater",
         "multi_view_state_analyzer",
+        "dialogue_manager",
         "planner",
         "candidate",
         "final_selector",

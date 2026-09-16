@@ -286,6 +286,8 @@ class TeacherRunner:
             "user_context": user_context,
             "state": state,
         }
+        if dialogue_mode is not None:
+            context["dialogue_mode"] = dialogue_mode
         plan = self._call(
             "planner",
             history,

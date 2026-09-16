@@ -182,6 +182,51 @@ _ROLE_PROMPTS = {
             "Output Contract": "Return ONLY JSON matching the supplied schema.",
         },
     ),
+    "dialogue_manager": _prompt(
+        Role="You are a dialogue-level emotional-support conversation manager.",
+        Objective=(
+            "Choose exactly one broad dialogue mode for the current supporter "
+            "response and, if the conversation continues, the next seeker turn."
+        ),
+        **{
+            "Available Inputs": (
+                "The complete public dialogue history, current User Context, the "
+                "complete current MultiViewStateAnalysis, previous mode, recent "
+                "selected supporter strategies, and soft/hard round references."
+            ),
+            "Responsibilities": (
+                "Return one of opening, exploration, comforting, action, or closing "
+                "and a concise transition reason grounded in the public inputs."
+            ),
+            "Procedure": (
+                "Use the latest seeker turn as primary evidence. The modes are soft "
+                "conversational orientations, not a mandatory sequence. You may keep "
+                "the previous mode, move forward, move backward, or skip a mode. "
+                "opening establishes the interaction and invites the initial concern. "
+                "exploration understands the situation, emotion, needs, constraints, "
+                "or unresolved questions. comforting prioritizes understanding, "
+                "validation, emotional accompaniment, and reduced interpersonal "
+                "pressure. action collaboratively considers information, choices, "
+                "coping approaches, or feasible next steps. closing provides the "
+                "final supporter response because the seeker has explicitly or "
+                "naturally indicated that the immediate conversation can end."
+            ),
+            "Constraints": (
+                "Do not choose a supporter strategy or write response content. Do not "
+                "choose action merely because the conversation is long. Do not choose "
+                "closing for a brief acknowledgment when the seeker remains engaged or "
+                "has an unresolved request. Do not keep exploring when further "
+                "questioning would be repetitive. Round limits are context for pacing; "
+                "they do not override dialogue evidence."
+            ),
+            "Quality Criteria": (
+                "The mode reflects the immediate broad direction supported by current "
+                "public evidence, and the reason makes the decision auditable without "
+                "prescribing a concrete response strategy."
+            ),
+            "Output Contract": "Return ONLY JSON matching the supplied schema.",
+        },
+    ),
     "planner": _prompt(
         Role="You are a support strategy planner.",
         Objective=(
@@ -336,6 +381,15 @@ def _resolved_prompt(role: str, context: dict[str, Any]) -> str:
             for strategy, definition in ESCONV_STRATEGIES.items()
         )
         prompt += f"\n\n# ESConv Strategy Catalog\n{catalog}"
+        if "dialogue_mode" in context:
+            prompt += (
+                "\n\n# Dialogue Mode Handling\n"
+                "Dialogue mode describes the broad direction of the conversation. "
+                "It is not a required strategy and does not override the latest seeker "
+                "turn, User Context, or STATE. Select strategies according to the "
+                "current evidence. Different strategies may be appropriate within the "
+                "same mode."
+            )
     if role == "candidate":
         strategy = context.get("strategy")
         if strategy not in ESCONV_STRATEGIES:
