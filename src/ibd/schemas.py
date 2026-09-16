@@ -324,6 +324,24 @@ class CallRecord(StrictModel):
     cached: bool = False
 
 
+class TurnObservation(StrictModel):
+    example_id: str
+    history: History
+    context_before: UserContext
+    context_patch: ContextPatch
+    context_after: UserContext
+    context_merge_errors: list[str]
+    state_analysis: MultiViewStateAnalysis
+    call_records: list[CallRecord]
+
+
+class TurnResponse(StrictModel):
+    plan: StrategyPlanSet
+    candidates: Annotated[list[Candidate], Field(min_length=1, max_length=3)]
+    final_selection: FinalSelection
+    call_records: list[CallRecord]
+
+
 class TeacherTrace(StrictModel):
     example_id: str
     split: Literal["train", "dev", "test", "diagnostic_holdout"] = "train"
@@ -339,6 +357,31 @@ class TeacherTrace(StrictModel):
     final_selection: FinalSelection
     final_response: str = Field(min_length=1)
     call_records: list[CallRecord]
+
+    @classmethod
+    def from_parts(
+        cls,
+        observation: TurnObservation,
+        response: TurnResponse,
+        *,
+        split: Literal["train", "dev", "test", "diagnostic_holdout"] = "train",
+    ) -> "TeacherTrace":
+        return cls(
+            example_id=observation.example_id,
+            split=split,
+            history=observation.history,
+            context_before=observation.context_before,
+            context_patch=observation.context_patch,
+            context_after=observation.context_after,
+            context_merge_errors=observation.context_merge_errors,
+            state_analysis=observation.state_analysis,
+            state=observation.state_analysis.state,
+            plan=response.plan,
+            candidates=response.candidates,
+            final_selection=response.final_selection,
+            final_response=response.final_selection.response,
+            call_records=[*observation.call_records, *response.call_records],
+        )
 
     @model_validator(mode="after")
     def validate_provenance(self) -> "TeacherTrace":
