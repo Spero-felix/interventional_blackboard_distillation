@@ -4,6 +4,7 @@ import pytest
 import yaml
 
 from conftest import ScriptedBackend
+from ibd.schemas import ContextPatch, UserContext
 from ibd.storage import read_jsonl, write_jsonl
 from ibd.teacher import TeacherRunner
 
@@ -232,7 +233,9 @@ def test_run_teacher_writes_trace_through_configured_backend(
             str(output_path),
         ]
     ) == 0
-    assert read_jsonl(output_path)[0]["example_id"] == "e-run"
+    output = read_jsonl(output_path)[0]
+    assert output["example_id"] == "e-run"
+    assert output["context_before"] == UserContext.empty().model_dump(mode="json")
     assert progress_calls == [
         {
             "desc": "teacher examples",
@@ -241,6 +244,51 @@ def test_run_teacher_writes_trace_through_configured_backend(
             "postfix": [{"example": "e-run"}],
         }
     ]
+
+
+def test_run_teacher_accepts_explicit_context_before(
+    tmp_path,
+    monkeypatch,
+    history,
+):
+    import ibd.cli as cli
+
+    config_path = tmp_path / "config.yaml"
+    input_path = tmp_path / "input.json"
+    output_path = tmp_path / "traces.jsonl"
+    _write_config(config_path)
+    context_payload = UserContext.empty().model_dump(mode="json")
+    context_payload["active_concerns"] = ["担心答辩"]
+    input_path.write_text(
+        json.dumps(
+            {
+                "example_id": "e-context-input",
+                "history": history.model_dump(mode="json"),
+                "context_before": context_payload,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "OpenAIBackend", lambda config: ScriptedBackend())
+
+    assert cli.main(
+        [
+            "run-teacher",
+            "--config",
+            str(config_path),
+            "--input",
+            str(input_path),
+            "--output",
+            str(output_path),
+        ]
+    ) == 0
+
+    output = read_jsonl(output_path)[0]
+    assert output["context_before"]["active_concerns"] == ["担心答辩"]
+    assert output["context_after"]["active_concerns"] == ["担心答辩"]
+    assert output["context_patch"] == ContextPatch.empty().model_dump(mode="json")
+    assert output["context_merge_errors"] == []
 
 
 def test_run_teacher_accepts_prepared_socialsim_artifact(
@@ -367,10 +415,22 @@ def test_run_teacher_continues_after_failure_and_writes_ledger(
         def __init__(self, backend, config):
             self.delegate = TeacherRunner(ScriptedBackend(), config)
 
-        def run(self, example_id, history, *, split="train"):
+        def run(
+            self,
+            example_id,
+            history,
+            *,
+            split="train",
+            context_before=None,
+        ):
             if example_id == "e-fail":
                 raise RuntimeError("simulated provider failure")
-            return self.delegate.run(example_id, history, split=split)
+            return self.delegate.run(
+                example_id,
+                history,
+                split=split,
+                context_before=context_before,
+            )
 
     config_path = tmp_path / "config.yaml"
     input_path = tmp_path / "input.json"

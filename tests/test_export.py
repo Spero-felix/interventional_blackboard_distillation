@@ -65,6 +65,25 @@ def test_visible_sft_export_keeps_native_history_and_split(history, app_config):
     assert row["response"].endswith("[response]" + trace.final_response)
 
 
+def test_student_exports_do_not_leak_context_audit_fields(history, app_config):
+    trace = TeacherRunner(ScriptedBackend(), app_config).run("e-no-context", history)
+    rows = (sft_row(trace), slot_row(trace), visible_sft_row(trace))
+
+    assert set(rows[0]) == {
+        "example_id",
+        "prompt",
+        "response",
+        "selected_strategy",
+    }
+    assert set(rows[1]) == {"example_id", "prompt", "state", "plan"}
+    assert set(rows[2]) == {"example_id", "split", "history", "response"}
+    for row in rows:
+        assert "context_before" not in row
+        assert "context_patch" not in row
+        assert "context_after" not in row
+        assert "context_merge_errors" not in row
+
+
 @pytest.mark.parametrize("split", ["test", "diagnostic_holdout"])
 def test_student_export_rejects_non_trainable_splits(history, app_config, split):
     trace = TeacherRunner(ScriptedBackend(), app_config).run(

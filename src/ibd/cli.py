@@ -14,6 +14,7 @@ from .progress import track
 from .schemas import (
     History,
     TeacherTrace,
+    UserContext,
 )
 from .storage import append_jsonl, read_jsonl, write_jsonl
 from .teacher import TeacherRunner
@@ -237,10 +238,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         for record in progress:
             progress.set_postfix(example=str(record["example_id"]))
             try:
+                context_before = (
+                    UserContext.model_validate(record["context_before"])
+                    if "context_before" in record
+                    else None
+                )
                 trace = runner.run(
                     str(record["example_id"]),
                     History.model_validate(record["history"]),
                     split=record.get("split", "train"),
+                    context_before=context_before,
                 )
             except Exception as exc:
                 if not args.continue_on_error:

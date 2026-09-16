@@ -9,6 +9,12 @@
 
 `train-pipeline` 按配置依次运行 A、B；`train --stage A|B` 可单独运行启用的阶段。B 阶段必须使用冻结 anchor artifact。
 
+## Seeker Context Memory
+
+教师推理每轮按照 `Context → STATE → PLAN → response` 的顺序执行。在线多轮推理使用 `TeacherSession` 自动携带上一轮 Context；离线 `run-teacher` 可在每条输入记录中显式提供 `context_before`。
+
+当前 SocialSim 默认预处理每个 conversation 只产生一个 target，因此不会自动形成跨 target 的 Context 轨迹。Context 只进入教师推理与 trace；首版学生训练输入保持不变。
+
 ## 常用命令
 
 ```bash
