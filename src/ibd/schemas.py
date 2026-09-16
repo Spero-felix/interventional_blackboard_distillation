@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 StrategyId = Literal["S1", "S2", "S3"]
 StrategyName = Literal[
@@ -84,6 +84,81 @@ STATE_ANCHOR_FIELDS: tuple[StateField, ...] = (
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+ContextText = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1),
+]
+
+CONTEXT_FIELDS = (
+    "active_concerns",
+    "events_and_triggers",
+    "functional_impacts",
+    "goals_and_priorities",
+    "people_and_relationships",
+    "constraints_and_resources",
+    "coping_attempts_and_outcomes",
+    "support_preferences_and_boundaries",
+    "communication_preferences",
+)
+
+
+class UserContext(StrictModel):
+    active_concerns: list[ContextText]
+    events_and_triggers: list[ContextText]
+    functional_impacts: list[ContextText]
+    goals_and_priorities: list[ContextText]
+    people_and_relationships: list[ContextText]
+    constraints_and_resources: list[ContextText]
+    coping_attempts_and_outcomes: list[ContextText]
+    support_preferences_and_boundaries: list[ContextText]
+    communication_preferences: list[ContextText]
+
+    @classmethod
+    def empty(cls) -> "UserContext":
+        return cls.model_validate({field: [] for field in CONTEXT_FIELDS})
+
+
+class ReplacePair(StrictModel):
+    old: ContextText
+    new: ContextText
+
+    @model_validator(mode="after")
+    def values_must_differ(self) -> "ReplacePair":
+        if self.old == self.new:
+            raise ValueError("replace.old and replace.new must differ")
+        return self
+
+
+class ContextReplacements(StrictModel):
+    active_concerns: list[ReplacePair]
+    events_and_triggers: list[ReplacePair]
+    functional_impacts: list[ReplacePair]
+    goals_and_priorities: list[ReplacePair]
+    people_and_relationships: list[ReplacePair]
+    constraints_and_resources: list[ReplacePair]
+    coping_attempts_and_outcomes: list[ReplacePair]
+    support_preferences_and_boundaries: list[ReplacePair]
+    communication_preferences: list[ReplacePair]
+
+    @classmethod
+    def empty(cls) -> "ContextReplacements":
+        return cls.model_validate({field: [] for field in CONTEXT_FIELDS})
+
+
+class ContextPatch(StrictModel):
+    add: UserContext
+    replace: ContextReplacements
+    remove: UserContext
+
+    @classmethod
+    def empty(cls) -> "ContextPatch":
+        return cls(
+            add=UserContext.empty(),
+            replace=ContextReplacements.empty(),
+            remove=UserContext.empty(),
+        )
 
 
 class DialogueTurn(StrictModel):
@@ -253,6 +328,10 @@ class TeacherTrace(StrictModel):
     example_id: str
     split: Literal["train", "dev", "test", "diagnostic_holdout"] = "train"
     history: History
+    context_before: UserContext = Field(default_factory=UserContext.empty)
+    context_patch: ContextPatch = Field(default_factory=ContextPatch.empty)
+    context_after: UserContext = Field(default_factory=UserContext.empty)
+    context_merge_errors: list[str] = Field(default_factory=list)
     state_analysis: MultiViewStateAnalysis
     state: StateBlackboard
     plan: StrategyPlanSet

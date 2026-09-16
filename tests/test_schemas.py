@@ -4,6 +4,9 @@ from pydantic import ValidationError
 from ibd.schemas import (
     AnalysisView,
     Candidate,
+    CONTEXT_FIELDS,
+    ContextPatch,
+    ContextReplacements,
     DialogueTurn,
     FinalSelection,
     FinalSelectionDecision,
@@ -11,9 +14,11 @@ from ibd.schemas import (
     MultiViewStateAnalysis,
     MultiViewStateViews,
     PlanSelection,
+    ReplacePair,
     STATE_ANCHOR_FIELDS,
     StateBlackboard,
     StrategyPlanSet,
+    UserContext,
 )
 
 
@@ -72,6 +77,57 @@ EXPECTED_STATE_VALUES = {
         "unknown",
     ),
 }
+
+
+def empty_context_payload() -> dict[str, list[str]]:
+    return {field: [] for field in CONTEXT_FIELDS}
+
+
+def test_user_context_requires_all_nine_string_list_fields() -> None:
+    payload = empty_context_payload()
+    payload["active_concerns"] = ["担心明天的答辩会再次卡住"]
+
+    context = UserContext.model_validate(payload)
+
+    assert tuple(context.model_dump()) == CONTEXT_FIELDS
+    assert context.active_concerns == ["担心明天的答辩会再次卡住"]
+
+
+def test_user_context_rejects_missing_extra_and_blank_values() -> None:
+    missing = empty_context_payload()
+    missing.pop("communication_preferences")
+    with pytest.raises(ValidationError):
+        UserContext.model_validate(missing)
+
+    extra = empty_context_payload() | {"readiness": []}
+    with pytest.raises(ValidationError):
+        UserContext.model_validate(extra)
+
+    blank = empty_context_payload()
+    blank["active_concerns"] = ["   "]
+    with pytest.raises(ValidationError):
+        UserContext.model_validate(blank)
+
+
+def test_context_patch_requires_complete_add_replace_remove_sections() -> None:
+    patch = ContextPatch.empty()
+
+    assert patch.add == UserContext.empty()
+    assert patch.remove == UserContext.empty()
+    assert patch.replace == ContextReplacements.empty()
+
+    with pytest.raises(ValidationError):
+        ContextPatch.model_validate(
+            {
+                "add": empty_context_payload(),
+                "remove": empty_context_payload(),
+            }
+        )
+
+
+def test_replace_pair_rejects_identical_old_and_new_values() -> None:
+    with pytest.raises(ValidationError):
+        ReplacePair(old="我不想听建议", new="我不想听建议")
 
 VALID_EVIDENCE = {
     field: {
