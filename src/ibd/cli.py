@@ -400,14 +400,6 @@ def _generate_conversations(args: argparse.Namespace) -> int:
         split=args.split,
     )
     config = AppConfig.from_yaml(args.config)
-    backend = OpenAIBackend(config)
-    generator = ConversationGenerator(
-        seeker=SeekerSimulator(backend, config),
-        teacher_runner=TeacherRunner(backend, config),
-        dialogue_manager=DialogueManager(backend, config),
-        generation_config=generation_config,
-        protocol_version=config.protocol_version,
-    )
     finalized_ids = (
         _stored_conversation_ids(output_path)
         | _stored_conversation_ids(truncated_path)
@@ -423,6 +415,20 @@ def _generate_conversations(args: argparse.Namespace) -> int:
         for profile in adapted_profiles
         if f"{profile.profile_id}-seed-{args.seed}" not in finalized_ids
     ]
+    if not pending_profiles:
+        print(
+            f"completed 0; truncated 0; failed {failure_count}"
+        )
+        return 1 if failure_count else 0
+
+    backend = OpenAIBackend(config)
+    generator = ConversationGenerator(
+        seeker=SeekerSimulator(backend, config),
+        teacher_runner=TeacherRunner(backend, config),
+        dialogue_manager=DialogueManager(backend, config),
+        generation_config=generation_config,
+        protocol_version=config.protocol_version,
+    )
     progress = track(
         pending_profiles,
         desc="generate conversations",
@@ -454,9 +460,11 @@ def _generate_conversations(args: argparse.Namespace) -> int:
             if isinstance(exc, ConversationStageError):
                 failed_stage = exc.stage
                 completed_rounds = exc.completed_rounds
+                root_error = exc.__cause__ if exc.__cause__ is not None else exc
             else:
                 failed_stage = "conversation_generator"
                 completed_rounds = len(checkpoint.rounds) if checkpoint else 0
+                root_error = exc
             append_jsonl(
                 failures_path,
                 ConversationFailure(
@@ -464,8 +472,8 @@ def _generate_conversations(args: argparse.Namespace) -> int:
                     profile_id=profile.profile_id,
                     seed=args.seed,
                     failed_stage=failed_stage,
-                    error_type=type(exc).__name__,
-                    error=str(exc),
+                    error_type=type(root_error).__name__,
+                    error=str(root_error),
                     completed_rounds=completed_rounds,
                     checkpoint_path=(
                         str(checkpoint_path) if checkpoint_path.is_file() else None

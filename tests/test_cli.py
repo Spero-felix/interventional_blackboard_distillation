@@ -38,16 +38,17 @@ def _write_config(path):
 
 
 class BatchConversationBackend(ScriptedBackend):
-    def __init__(self):
+    def __init__(self, *, fail_second_resume_seeker=False):
         super().__init__()
         self.active_profile = None
+        self.fail_second_resume_seeker = fail_second_resume_seeker
 
     def complete(self, *, role, messages, model_config, json_mode=True, seed=None):
         from ibd.backend import LLMResult
 
         if role == "seeker_simulator":
             rendered = messages[1]["content"]
-            for profile_id in ("p-complete", "p-truncated", "p-fail"):
+            for profile_id in ("p-complete", "p-truncated", "p-fail", "p-resume"):
                 if profile_id in rendered:
                     self.active_profile = profile_id
                     break
@@ -62,6 +63,12 @@ class BatchConversationBackend(ScriptedBackend):
             )
             if self.active_profile == "p-fail":
                 raise RuntimeError("simulated seeker provider failure")
+            if (
+                self.active_profile == "p-resume"
+                and self.fail_second_resume_seeker
+                and json.loads(messages[1]["content"])["round_index"] == 2
+            ):
+                raise RuntimeError("simulated second-round interruption")
             return LLMResult(text="我想谈谈最近的压力。")
         if role == "dialogue_manager":
             self.calls.append(
@@ -73,7 +80,13 @@ class BatchConversationBackend(ScriptedBackend):
                     "seed": seed,
                 }
             )
-            mode = "closing" if self.active_profile == "p-complete" else "exploration"
+            round_index = json.loads(messages[1]["content"])["context"]["round_index"]
+            mode = (
+                "closing"
+                if self.active_profile == "p-complete"
+                or (self.active_profile == "p-resume" and round_index == 2)
+                else "exploration"
+            )
             return LLMResult(
                 text=json.dumps(
                     {"mode": mode, "transition_reason": f"选择 {mode}"},
@@ -826,11 +839,8 @@ def test_generate_conversations_routes_completed_truncated_and_failure_records(
             "checkpoint_path": None,
             "completed_rounds": 0,
             "conversation_id": "p-fail-seed-42",
-            "error": (
-                "conversation generation failed during seeker_simulator "
-                "after 0 complete rounds"
-            ),
-            "error_type": "ConversationStageError",
+            "error": "simulated seeker provider failure",
+            "error_type": "RuntimeError",
             "failed_stage": "seeker_simulator",
             "profile_id": "p-fail",
             "seed": 42,
@@ -871,7 +881,10 @@ def test_generate_conversations_resume_skips_finalized_outputs(tmp_path, monkeyp
     assert cli.main(args) == 0
 
     replay_backend = BatchConversationBackend()
-    monkeypatch.setattr(cli, "OpenAIBackend", lambda config: replay_backend)
+    def reject_backend_construction(config):
+        raise AssertionError("finalized resume must not construct a backend")
+
+    monkeypatch.setattr(cli, "OpenAIBackend", reject_backend_construction)
     assert cli.main([*args, "--resume"]) == 0
 
     assert replay_backend.calls == []
@@ -915,6 +928,70 @@ def test_generate_conversations_rejects_duplicate_normalized_profile_ids(
     with pytest.raises(ValueError, match="duplicate profile ID: duplicate"):
         cli.main(_conversation_cli_args(config_path, profiles_path, paths))
     assert backend.calls == []
+
+
+def test_generate_conversations_records_adapter_failure_without_backend(
+    tmp_path,
+    monkeypatch,
+):
+    import ibd.cli as cli
+
+    config_path = tmp_path / "config.yaml"
+    profiles_path = tmp_path / "profiles.json"
+    paths = _conversation_cli_paths(tmp_path)
+    _write_config(config_path)
+    profiles_path.write_text(json.dumps([{"Situation": "missing ID"}]), encoding="utf-8")
+
+    def reject_backend_construction(config):
+        raise AssertionError("adapter-only failure must not construct a backend")
+
+    monkeypatch.setattr(cli, "OpenAIBackend", reject_backend_construction)
+
+    assert cli.main(_conversation_cli_args(config_path, profiles_path, paths)) == 1
+    assert read_jsonl(paths["failures"])[0]["failed_stage"] == "profile_adapter"
+
+
+def test_generate_conversations_resume_loads_unfinished_checkpoint(
+    tmp_path,
+    monkeypatch,
+):
+    import ibd.cli as cli
+
+    config_path = tmp_path / "config.yaml"
+    profiles_path = tmp_path / "profiles.json"
+    paths = _conversation_cli_paths(tmp_path)
+    _write_config(config_path)
+    profiles_path.write_text(json.dumps([{"ID": "p-resume"}]), encoding="utf-8")
+    first_backend = BatchConversationBackend(fail_second_resume_seeker=True)
+    monkeypatch.setattr(cli, "OpenAIBackend", lambda config: first_backend)
+    args = _conversation_cli_args(
+        config_path,
+        profiles_path,
+        paths,
+        "--min-rounds",
+        "1",
+        "--soft-max-rounds",
+        "2",
+        "--hard-max-rounds",
+        "3",
+    )
+
+    assert cli.main(args) == 1
+    assert len(list(paths["checkpoints"].glob("*.json"))) == 1
+
+    resumed_backend = BatchConversationBackend()
+    monkeypatch.setattr(cli, "OpenAIBackend", lambda config: resumed_backend)
+    assert cli.main([*args, "--resume"]) == 0
+
+    completed = read_jsonl(paths["output"])
+    assert completed[0]["status"] == "completed"
+    assert len(completed[0]["rounds"]) == 2
+    seeker_rounds = [
+        json.loads(call["messages"][1]["content"])["round_index"]
+        for call in resumed_backend.calls
+        if call["role"] == "seeker_simulator"
+    ]
+    assert seeker_rounds == [2]
 
 
 def test_flatten_conversations_writes_teacher_trace_rows(tmp_path, monkeypatch):

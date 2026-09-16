@@ -138,6 +138,10 @@ class ConversationTrace(StrictModel):
     @model_validator(mode="after")
     def validate_conversation(self) -> "ConversationTrace":
         _validate_complete_rounds(self.turns, self.rounds)
+        if len(self.seeker_call_records) != len(self.rounds):
+            raise ValueError("conversation must contain one seeker call record per round")
+        if any(record.role != "seeker_simulator" for record in self.seeker_call_records):
+            raise ValueError("seeker call records must use the seeker_simulator role")
         if self.termination.round_count != len(self.rounds):
             raise ValueError("termination round count must equal stored rounds")
         final_mode = self.rounds[-1].dialogue_decision.decision.mode
@@ -172,6 +176,10 @@ class ConversationCheckpoint(StrictModel):
     @model_validator(mode="after")
     def validate_checkpoint(self) -> "ConversationCheckpoint":
         _validate_complete_rounds(self.turns, self.rounds)
+        if len(self.seeker_call_records) != len(self.rounds):
+            raise ValueError("checkpoint must contain one seeker call record per round")
+        if any(record.role != "seeker_simulator" for record in self.seeker_call_records):
+            raise ValueError("seeker call records must use the seeker_simulator role")
         if self.next_round_index != len(self.rounds) + 1:
             raise ValueError("next round index must follow stored complete rounds")
         if self.rounds:

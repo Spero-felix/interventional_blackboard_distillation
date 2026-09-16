@@ -178,3 +178,11 @@ def test_conversation_rejects_non_contiguous_turn_indexes(app_config):
 
     with pytest.raises(ValidationError, match="turn indexes must be contiguous"):
         ConversationTrace.model_validate(payload)
+
+
+def test_conversation_rejects_missing_seeker_call_record(app_config):
+    payload = _conversation_payload(app_config)
+    payload["seeker_call_records"] = []
+
+    with pytest.raises(ValidationError, match="one seeker call record per round"):
+        ConversationTrace.model_validate(payload)
